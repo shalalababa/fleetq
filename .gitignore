@@ -1,0 +1,27 @@
+# Runtime data under Q_ROOT (defaults to this checkout).  Never commit.
+/config.env
+/spool/
+/state/
+/cache/
+/local_out/
+/logs/
+/stage/
+/inputs/
+/vultr/
+/fleet_state/
+/waves/
+/qd.log*
+/qd.lock
+/qd_supervise.lock
+/qd_supervise.pid
+/supervise.log*
+/BOARD.txt
+/ledger.tsv
+# test sandboxes and scratch install roots
+/tests/run_*/
+/.scratch/
+# generated wave artifacts
+examples/**/generated*/
+__pycache__/
+*.pyc
+.pytest_cache/

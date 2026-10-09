@@ -1,0 +1,30 @@
+# fleet failure signatures
+#
+# class <TAB> retry <TAB> extended-regex <TAB> what it means / what to do
+#
+# TSV rather than YAML on purpose: box-side bash (box/lanes.sh) greps this file directly
+# with no parser, and controller-side triage.py reads the same file. One source, two
+# consumers, no generation step.
+#
+# `retry` is what a retry of the SAME command on the SAME hardware would do:
+#   same     -- transient; retrying as-is is reasonable
+#   other    -- deterministic here, may pass on different hardware (bigger GPU)
+#   never    -- retrying cannot help; something must change first
+#   unknown  -- not classified; escalate, never auto-act
+#
+# THIS FILE IS MEANT TO GROW. Every failure diagnosed once should be appended,
+# which is the whole point: the system's coverage increases monotonically
+# instead of each diagnosis being re-derived and forgotten.
+#
+# Order matters: first match wins, so put specific patterns above general ones.
+
+oom	other	RESOURCE_EXHAUSTED|Out of memory allocating|CUDA out of memory|OutOfMemoryError|cudaErrorMemoryAllocation	GPU ran out of VRAM. Retrying on the same card will fail again. Move the affected cells to a larger GPU, or reduce memory fraction (a config change: it must apply to every cell of the arm, or comparability breaks).
+disk_full	never	No space left on device|ENOSPC|Disk quota exceeded	Filesystem full. Checkpoints written during this period may be truncated but look complete -- verify realized counters before trusting any run from this window, not just the failed one.
+missing_input	never	no done ckpt under|ERROR: no done checkpoint under	A required input checkpoint is absent. Either the producing wave never finished or the input push missed it. Check the producer with `fleet check`, then push the inputs again.
+missing_module	never	ModuleNotFoundError|MISSING adapter deps|ImportError: cannot import name	A python dependency is missing from the env this task ran in. Check WHICH interpreter the task line resolves to before installing anything: a bare `python` means whatever the box env puts first on PATH.
+hydra_override	never	Could not override|key .* is not in struct|ConfigAttributeError	Hydra config key error. An existing key takes `key=value`; only a genuinely new key takes `+key=value`.
+cuda_driver	same	CUDA error|no CUDA-capable device|CUDA driver version is insufficient|Failed to initialize NVML	Driver or device fault. Often transient after a reset, but a repeat on the same instance means the host is sick -- prefer re-renting over fighting it.
+rsync_broken	never	rsync: connection unexpectedly closed|/usr/bin/rsync: Permission denied	The REMOTE rsync binary is broken (seen once: a 0-byte non-executable stub after the box disk filled). The sender-side message is misleading. Reinstall rsync on the box.
+killed_oom_host	other	Killed$|signal 9|out of memory: Killed process	Host OOM-killer took the process (system RAM, not VRAM). Reduce concurrent tasks per instance or move to a box with more RAM.
+timeout_slurm	other	DUE TO TIME LIMIT|CANCELLED AT .* DUE TO TIME	Slurm walltime exceeded. Raise --time (within the partition maximum) or split the work; the partial checkpoint may be resumable but verify realized steps.
+nan_loss	never	loss is NaN|nan in loss|Invalid loss	Training diverged. Not an ops failure: retrying reproduces it. Needs a look at the run, not a requeue.

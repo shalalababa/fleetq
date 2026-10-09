@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# fleet -- controller-side CLI for rented GPU boxes and multi-run waves.
+#
+# Boxes are numbered (N); their addresses come from $FLEET_STATE/instances.env
+# (written by `fleet refresh`) or IP<N>/PORT<N> exported in your shell.  Each
+# box runs box/lanes.sh: one FIFO lane per GPU, driven by an on-box supervisor,
+# watched by box/watchdog.sh.  Waves are declared once in a spec
+# ($FLEET_WAVES/<wave>/spec.json|yaml) and every per-wave script is generated
+# from it, so what is submitted, what counts as done and what gets pulled
+# cannot drift apart.
+#
+# The CPU/batch queue (bin/q + bin/qd) is separate; this CLI only shares its
+# config file (config.env) and install root (Q_ROOT).
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+FLEET_HOME="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+source "$FLEET_HOME/fleet/common.sh"
+
+usage () {
+  cat <<'USAGE'
+fleet <verb> [args]
+
+  boxes
+    refresh                 vastai inventory -> instances.json/.env (sticky box numbers)
+    push-repo N...          project rsync + box scripts + VERSION stamp + restart watchdog
+    versions [N...]         VERSION stamp per box vs the project repo HEAD
+    status N [--json]       lane status on one box
+    board-raw [N...]        status --json for each box (one JSON line per box)
+    board [N...]            fleet table: every lane, progress, re-projected drain time
+    sh N [cmd...]           ssh into box N (no cmd = interactive)
+    watch N [secs]          nvidia-smi + lane log loop on box N
+    events N [k]            tail the box event log (what the watchdog/queue emitted)
+    destroy N [--yes]       destroy a Vast box -- REPORTS by default; refuses
+                            unless every run dir on it is already archived
+    cluster-connect [--status|--close]
+                            open/reuse ONE shared ssh connection to the cluster
+                            login node, so later cluster commands skip 2FA
+
+  waves (all take --wave <wave_id>)
+    gen --wave W [--lanes 0,1,2,3]    spec -> RUN_IDS, lane cmds, preflight, pull, bundle
+    preflight N [--wave W]            assertions on a box before submitting
+    submit --wave W N                 approval prompt, then queue every lane
+    check --wave W [--json|--pending] completion by realized counters, not markers
+    requeue --wave W N                retry exactly the runs the checker says are not done
+    pull --wave W N...                two-pass result pull from box(es) into $RUNROOT
+    bundle --wave W                   bundle + COMPLETION.txt + sha256 manifest
+
+  planning and diagnosis
+    durations scan DIR...   backfill measured runtimes from run logs (--gpu NAME)
+    durations show          the measured duration table
+    pack --wave W           LPT lane assignment over measured durations (advisory)
+    triage classify LOG...  match a failure log against failure_signatures.tsv
+    triage brief --wave W   one block per failed run: signature, retry advice
+    digest [N...]           overnight: what happened, what self-healed, what
+                            needs you, and idle GPU-hours burned
+
+Config: $Q_ROOT/config.env (see config.env.example).  Q_ROOT defaults to the
+checkout.
+USAGE
+}
+
+verb="${1:-help}"; shift || true
+
+# Pull --wave/--lanes out of the argument list up front so each verb sees only
+# its positional arguments.
+WAVE=""; LANES=""; ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --wave)  WAVE="${2:?--wave needs a wave id}"; shift 2 ;;
+    --lanes) LANES="${2:?--lanes needs a list}"; shift 2 ;;
+    *)       ARGS+=("$1"); shift ;;
+  esac
+done
+set -- ${ARGS+"${ARGS[@]}"}
+
+wave_dir () {
+  [ -n "$WAVE" ] || die "this verb needs --wave <wave_id>"
+  local d="$FLEET_WAVES/$WAVE"
+  [ -d "$d" ] || die "no such wave: $d"
+  printf '%s' "$d"
+}
+
+all_boxes () {
+  compgen -A variable | sed -n 's/^IP\([0-9]\+\)$/\1/p' | sort -n
+}
+
+case "$verb" in
+
+  push-repo)
+    [ $# -gt 0 ] || die "usage: fleet push-repo N [N...]"
+    # Per-box isolation. fl_push_repo calls die() on failure, and die() exits
+    # the SCRIPT -- so a single unreachable box used to abort the loop and
+    # silently skip every one after it, leaving a fleet that looks pushed
+    # because the command "finished".
+    pr_ok=(); pr_bad=()
+    for n in "$@"; do
+      echo "=================== box $n ==================="
+      if ( fl_push_repo "$n" ); then pr_ok+=("$n"); else pr_bad+=("$n"); fi
+    done
+    echo
+    echo "push-repo: ${#pr_ok[@]} ok${pr_ok[*]+ (${pr_ok[*]})}"
+    if [ ${#pr_bad[@]} -gt 0 ]; then
+      echo "push-repo: ${#pr_bad[@]} FAILED (${pr_bad[*]}) -- these still run old code" >&2
+      echo "           re-run individually to see the error:  fleet push-repo ${pr_bad[0]}" >&2
+      exit 1
+    fi
+    # Confirm the stamp actually landed, rather than trusting that rsync ran.
+    echo
+    bash "$0" versions "$@"
+    ;;
+
+  versions)
+    fl_load_instances
+    local_sha="unknown"
+    [ -n "${FLEET_PROJECT_REPO:-}" ] &&
+      local_sha="$(git -C "$FLEET_PROJECT_REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    echo "project HEAD: $local_sha"
+    targets=("$@")
+    [ ${#targets[@]} -gt 0 ] || mapfile -t targets < <(all_boxes)
+    [ ${#targets[@]} -gt 0 ] || die "no boxes known (export IP<N>/PORT<N> or run refresh)"
+    printf '%-6s %-44s %s\n' BOX VERSION STATUS
+    for n in "${targets[@]}"; do
+      v="$(fl_ssh_box "$n" 'fl_version' 2>/dev/null | tail -1)"
+      [ -n "$v" ] || v="UNREACHABLE"
+      case "$v" in
+        "$local_sha"*) st="ok" ;;
+        UNREACHABLE)   st="-" ;;
+        UNKNOWN*)      st="NO STAMP (needs push-repo)" ;;
+        *)             st="SKEW (needs push-repo)" ;;
+      esac
+      printf '%-6s %-44s %s\n' "$n" "${v:0:44}" "$st"
+    done
+    ;;
+
+  status)
+    n="${1:?usage: fleet status N [--json]}"; shift || true
+    if [ "${1:-}" = "--json" ]; then
+      fl_ssh_box "$n" 'fl_status --json'
+    else
+      fl_ssh_box "$n" 'fl_status'
+    fi
+    ;;
+
+  board-raw)
+    fl_load_instances
+    targets=("$@")
+    [ ${#targets[@]} -gt 0 ] || mapfile -t targets < <(all_boxes)
+    for n in "${targets[@]}"; do
+      # Capture, THEN print. Interleaving printf with a command whose output
+      # ends in a newline splits each record across two lines, and a
+      # line-oriented consumer then drops every one of them.
+      st="$(fl_ssh_box "$n" 'fl_status --json' 2>/dev/null | tail -1)"
+      printf '{"instance":"%s","state":%s}\n' "$n" "${st:-null}"
+    done
+    ;;
+
+  board)
+    bash "$0" board-raw "$@" | python3 "$FLEET_HOME/fleet/board.py" ${GPU:+--gpu "$GPU"}
+    ;;
+
+  sh)
+    n="${1:?usage: fleet sh N [cmd...]}"; shift || true
+    if [ $# -eq 0 ]; then
+      fl_require_instance "$n"
+      exec ssh -t -p "$(fl_port "$n")" "${FL_SSH_OPTS[@]}" "root@$(fl_ip "$n")"
+    else
+      fl_ssh_box "$n" "$*"
+    fi
+    ;;
+
+  watch)
+    n="${1:?usage: fleet watch N [secs]}"; secs="${2:-15}"
+    fl_require_instance "$n"
+    exec ssh -t -p "$(fl_port "$n")" "${FL_SSH_OPTS[@]}" "root@$(fl_ip "$n")" \
+      "bash -lc $(printf '%q' "source /root/.fleet_env; source \"\$FLEET_BOX_HOME/lanes.sh\"; fl_watch $secs")"
+    ;;
+
+  events)
+    n="${1:?usage: fleet events N [lines]}"; k="${2:-40}"
+    fl_ssh_box "$n" "tail -n $k \"\$RUNROOT/_cloud_logs/events.jsonl\" 2>/dev/null || echo 'no events yet'"
+    ;;
+
+  destroy)
+    exec bash "$FLEET_HOME/fleet/destroy_box.sh" "$@"
+    ;;
+
+  cluster-connect)
+    exec bash "$FLEET_HOME/fleet/cluster_connect.sh" "$@"
+    ;;
+
+  refresh)
+    exec python3 "$FLEET_HOME/fleet/refresh.py" "$@"
+    ;;
+
+  gen)
+    exec python3 "$FLEET_HOME/fleet/wavegen.py" "$(wave_dir)" \
+      ${LANES:+--lanes "$LANES"}
+    ;;
+
+  check)
+    exec python3 "$FLEET_HOME/fleet/wavecheck.py" "$(wave_dir)" \
+      --runroot "$RUNROOT" "$@"
+    ;;
+
+  preflight)
+    n="${1:?usage: fleet preflight N [--wave W]}"
+    if [ -n "$WAVE" ]; then
+      w="$(wave_dir)"
+      [ -f "$w/generated/preflight_remote.sh" ] ||
+        die "no generated preflight for $WAVE -- run 'fleet gen --wave $WAVE' first"
+      note "preflight box $n against wave $WAVE"
+      # Pass the script as TEXT, not on stdin. fl_ssh_box already pipes its
+      # own wrapper into ssh, so a `bash -s` here would read an
+      # already-consumed stdin and get nothing: the preflight printed no
+      # checks at all and an empty report reads exactly like a clean pass.
+      pf="$(cat "$w/generated/preflight_remote.sh")"
+      out="$(fl_ssh_box "$n" "$pf")"
+      printf '%s\n' "$out"
+      # A preflight that produced no PASS/FAIL lines did not run. Say so
+      # rather than letting silence stand in for success.
+      case "$out" in
+        *PASS*|*FAIL*) ;;
+        *) die "preflight produced no checks on box $n -- it did not run" ;;
+      esac
+      case "$out" in *FAIL*) exit 1 ;; esac
+    else
+      fl_ssh_box "$n" '
+        echo "== repo =="
+        [ -n "$(ls -A "$REPO" 2>/dev/null)" ] && echo "  PASS REPO=$REPO" || echo "  FAIL empty REPO=$REPO -- run push-repo"
+        echo "== helpers =="; fl_version
+        echo "== disk =="; df -h "$RUNROOT" | tail -1
+        echo "== gpu =="; nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader'
+    fi
+    ;;
+
+  submit)
+    w="$(wave_dir)"
+    n="${1:?usage: fleet submit --wave W <box>}"
+    [ -f "$w/generated/submit.sh" ] || die "run 'fleet gen' first"
+    echo "About to submit to box $n:"
+    sed -n '1,12p' "$w/generated/RUN_IDS.txt"
+    echo "Full list: $w/generated/RUN_IDS.txt"
+    read -r -p "Submit? [y/N] " ans
+    [ "$ans" = y ] || die "aborted"
+    exec bash "$w/generated/submit.sh" "$n"
+    ;;
+
+  pull)
+    w="$(wave_dir)"
+    [ -f "$w/generated/pull_results.sh" ] || die "run 'fleet gen' first"
+    exec bash "$w/generated/pull_results.sh" "$@"
+    ;;
+
+  bundle)
+    w="$(wave_dir)"
+    [ -f "$w/generated/bundle.sh" ] || die "this wave's spec declares no bundle"
+    exec bash "$w/generated/bundle.sh"
+    ;;
+
+  requeue)
+    w="$(wave_dir)"
+    n="${1:?usage: fleet requeue --wave W <box>}"
+    pend="$(mktemp)"; trap 'rm -f "$pend"' EXIT
+    python3 "$FLEET_HOME/fleet/wavecheck.py" "$w" --runroot "$RUNROOT" --pending > "$pend"
+    cnt="$(wc -l < "$pend")"
+    [ "$cnt" -gt 0 ] || { echo "nothing pending; wave is complete"; exit 0; }
+    echo "$cnt run(s) not complete:"; cat "$pend"
+    echo
+    echo "These are regenerated verbatim from the original expansion -- same"
+    echo "configs, same hardware unless you move them. If a cell failed for a"
+    echo "reason a retry cannot fix (OOM), send it elsewhere instead."
+    read -r -p "Requeue these on box $n? [y/N] " ans
+    [ "$ans" = y ] || die "aborted"
+    python3 "$FLEET_HOME/fleet/wavegen.py" "$w" --only-runs "$pend" \
+      --out "$w/generated_requeue" --quiet ${LANES:+--lanes "$LANES"}
+    exec bash "$w/generated_requeue/submit.sh" "$n"
+    ;;
+
+  durations)
+    exec python3 "$FLEET_HOME/fleet/durations.py" "$@"
+    ;;
+
+  pack)
+    [ -n "$WAVE" ] || die "usage: fleet pack --wave W [--lanes 0,1,2,3] [--gpu NAME]"
+    exec python3 "$FLEET_HOME/fleet/packing.py" --wave "$WAVE" \
+      ${LANES:+--lanes "$LANES"} "$@"
+    ;;
+
+  triage)
+    exec python3 "$FLEET_HOME/fleet/triage.py" "$@" ${WAVE:+--wave "$WAVE"}
+    ;;
+
+  digest)
+    # Gather events from every box, merge, render. Boxes keep their own
+    # events.jsonl, so a digest works even if ntfy dropped or you never looked.
+    fl_load_instances
+    targets=("$@")
+    [ ${#targets[@]} -gt 0 ] || mapfile -t targets < <(all_boxes)
+    {
+      for n in "${targets[@]}"; do
+        fl_ssh_box "$n" 'cat "$RUNROOT/_cloud_logs/events.jsonl" 2>/dev/null || true' 2>/dev/null
+      done
+    } | python3 "$FLEET_HOME/fleet/digest.py" ${SINCE:+--since "$SINCE"}
+    echo
+    echo "=== board ==="
+    bash "$0" board ${targets[@]+"${targets[@]}"} || true
+    ;;
+
+  help|-h|--help) usage ;;
+  *) usage; die "unknown verb: $verb" ;;
+esac

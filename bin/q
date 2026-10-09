@@ -1,0 +1,355 @@
+#!/usr/bin/env bash
+# q — the job-queue CLI.  NO gcloud/gsutil/sbatch/ssh ever runs from here:
+# `q submit` drops a spec file in the spool, `qd` does everything else.
+#
+#   q submit --name N --cmds lanes.cmds [--site local|batch|vast|vultr|either] [--cpus C]
+#            [--mem 2G] [--threads T] [--priority P] [--resumable 1] [--spot 1|0]
+#            [--image IMG] [--inputs SUBPATH] [--timeout 6h] [--machine M] [--gpu 1] [--vm-cpus N] [--vast-box ID] [--vast-chunk N] [--vast-any]
+#   q status [N] | q list | q log N | q pull N DEST | q cancel N | q board | q vultr doctor|plans|fleet
+set -euo pipefail
+QCODE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+QROOT="${Q_ROOT:-$QCODE}"
+PY=${Q_PYTHON:-python3}
+die(){ echo "q: $*" >&2; exit 1; }
+usage(){ sed -n '2,8p' "$QCODE/bin/q"; exit 1; }
+
+cmd=${1:-}; shift || true
+if [ "$cmd" = vultr ]; then
+  Q_ROOT="$QROOT" exec "$PY" "$QCODE/lib/vultr_admin.py" "$@"
+fi
+case "$cmd" in
+submit)
+  name=""; cmds=""; site="either"; cpus=2; mem="2G"; threads=""; prio=0
+  resumable=1; spot=1; spot_explicit=0; image=""; inputs=""; timeout="6h"; machine=""; gpu=0; vm_cpus=0; vast_box=""; vast_chunk=0; vast_any=0
+  while [ $# -gt 0 ]; do case "$1" in
+    --name) name=$2; shift 2;;      --cmds) cmds=$2; shift 2;;
+    --site) site=$2; shift 2;;      --cpus) cpus=$2; shift 2;;
+    --mem) mem=$2; shift 2;;        --threads) threads=$2; shift 2;;
+    --priority) prio=$2; shift 2;;  --resumable) resumable=$2; shift 2;;
+    --spot) spot=$2; spot_explicit=1; shift 2;;      --image) image=$2; shift 2;;
+    --inputs) inputs=$2; shift 2;;  --timeout) timeout=$2; shift 2;;
+    --machine) machine=$2; shift 2;; --gpu) gpu=$2; shift 2;;
+    --vm-cpus) vm_cpus=$2; shift 2;;
+    --vast-box) vast_box=$2; shift 2;;
+    --vast-chunk) vast_chunk=$2; shift 2;;
+    --vast-any) vast_any=1; shift 1;;
+    -h|--help) usage;;
+    *) die "unknown arg $1";; esac; done
+  [ -n "$name" ] || die "need --name"
+  [ -n "$cmds" ] && [ -f "$cmds" ] || die "need --cmds FILE (existing)"
+  case "$site" in local|batch|vast|vultr|either) ;; *) die "--site must be local|batch|vast|vultr|either";; esac
+  if [ "$site" = vultr ] && [ "$spot_explicit" = 0 ]; then spot=0; fi
+  cmds_abs=$(cd "$(dirname "$cmds")" && pwd)/$(basename "$cmds")
+  Q_ROOT="$QROOT" QCODE="$QCODE" "$PY" - "$name" "$cmds_abs" "$site" "$cpus" "$mem" \
+      "$threads" "$prio" "$resumable" "$spot" "$image" "$inputs" "$timeout" "$machine" \
+      "$gpu" "$spot_explicit" "$vm_cpus" "$vast_box" "$vast_chunk" "$vast_any" <<'PY'
+import json, os, shutil, sys, time
+sys.path.insert(0, os.path.join(os.environ["QCODE"], "lib"))
+import qcommon as Q
+(name, cmds, site, cpus, mem, threads, prio, resumable, spot, image, inputs,
+ timeout, machine, gpu, spot_explicit, vm_cpus, vast_box, vast_chunk, vast_any) = sys.argv[1:]
+# An unpinned vast job drifts to whichever box has the lowest load.  In
+# production one did exactly that: an idle box attracted it, and every task died
+# in 0 s with
+#   flock: cannot open lock file /workspace/<project>/gpu0.lock
+# because the job's assets lived on a different box — 15 tasks burned per
+# dispatch.  A vast job whose assets, venv or lock files live on ONE box must
+# say so.
+# --inputs WAS SILENTLY IGNORED on vast.  site_batch.py reads spec["inputs"] and
+# moves $IN; site_vast.py never reads it — submit_chunk() stages only
+# lanes.cmds, the idx file and runner.sh, and vast_runner.sh sets
+# IN="${QVAST_IN:-/workspace/inputs}".  So a vast job passing --inputs ran
+# against whatever happened to sit at that fixed path, with no error and no log
+# line.  It is now refused instead.
+if site == 'vast' and inputs:
+    sys.exit("q: --inputs does nothing on --site vast and is refused rather than "
+             "silently ignored.\n"
+             "   $IN on a box is QVAST_IN (default /workspace/inputs), not the "
+             "inputs subpath.\n"
+             "   Stage with lib/vast_inputs_push.sh (same GCS route, "
+             "sha-verified), then reference the staged absolute path in your "
+             "cmds lines, or set QVAST_IN.")
+if site == 'vast' and not vast_box and vast_any != '1':
+    sys.exit("q: --site vast needs --vast-box N (the box holding this job's "
+             "assets/venv/locks).\n"
+             "   An unpinned vast job migrates to the idlest box and fails "
+             "there if its assets are not present.\n"
+             "   If this job really can run on ANY box, pass --vast-any to say so "
+             "deliberately.")
+if vast_box and site != 'vast':
+    sys.exit('q: --vast-box is only for --site vast')
+try: vast_chunk = int(vast_chunk)
+except ValueError: sys.exit('q: --vast-chunk needs an integer')
+if vast_chunk and site != 'vast':
+    sys.exit('q: --vast-chunk is only for --site vast')
+if vast_chunk < 0:
+    sys.exit('q: --vast-chunk must be >= 0 (0 = default, one chunk per worker slot)')
+try: vm_cpus = int(vm_cpus)
+except ValueError: sys.exit('q: --vm-cpus needs a positive integer')
+if vm_cpus < 0 or (vm_cpus and site != 'vultr'):
+    sys.exit('q: --vm-cpus is a positive VM size for --site vultr')
+for label, val in (("--cpus", cpus), ("--priority", prio), ("--gpu", gpu),
+                   ("--threads", threads or "1")):
+    try:
+        float(val)
+    except ValueError:
+        sys.exit("q: %s needs a number, got %r" % (label, val))
+if not Q.valid_name(name):
+    sys.exit("q: --name must match [a-z][a-z0-9-]{1,44} (it becomes a Batch job name)")
+Q.ensure_tree()
+pend_path = os.path.join(Q.P["pending"], name + ".json")
+prev = Q.load_state(name)
+TERM = ("DONE", "FAILED", "CANCELLED")
+if os.path.exists(pend_path):
+    sys.exit("q: %r is already spooled and not yet ingested — wait a cycle, or "
+             "`q cancel %s`" % (name, name))
+if prev is None and os.path.exists(Q.state_path(name)):
+    sys.exit("q: %r has a state file that cannot be parsed (%s). Move it aside "
+             "before reusing the name." % (name, Q.state_path(name)))
+if prev and prev.get("state") not in TERM:
+    sys.exit("q: %r is live in the queue (state %s) — pick another name, or "
+             "`q cancel %s` and resubmit after the daemon's next cycle"
+             % (name, prev.get("state"), name))
+epoch = 0
+if prev:
+    # THE RESUBMIT-IS-A-RESUME PATH.  The old state is archived, the name is
+    # reused, and every task whose $OUT/_rc.txt is already 0 is skipped.  (Before
+    # this, `q cancel X` followed by `q submit --name X` told you to run
+    # `q cancel X` — which you just had.)
+    epoch = 1 + int((prev.get("spec") or {}).get("epoch", 0) or 0)
+    arch = os.path.join(Q.P["state"], "archive")
+    os.makedirs(arch, exist_ok=True)
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    os.replace(Q.state_path(name), os.path.join(arch, "%s.%s.json" % (name, ts)))
+    old_cmds = os.path.join(Q.P["cmds"], name + ".cmds")
+    if os.path.exists(old_cmds):
+        os.replace(old_cmds, os.path.join(arch, "%s.%s.cmds" % (name, ts)))
+    print("q: %s was %s — archived to state/archive/ and resubmitted as epoch %d; "
+          "tasks whose $OUT/_rc.txt is 0 will NOT be re-run" % (name, prev["state"], epoch))
+# A cancelled epoch can be immediately replaced by a deliberate resubmit.
+# The old name-only cancellation marker must not cancel that new epoch after
+# ingestion; this submit is the explicit new intent.
+cancel_path = os.path.join(Q.P["cancel"], name)
+if os.path.exists(cancel_path):
+    os.unlink(cancel_path)
+    print("q: cleared stale cancellation marker while resubmitting %s" % name)
+# our own immutable copy: blank lines dropped, so task i is the i-th NON-BLANK line
+lines = [l.rstrip("\n") for l in open(cmds) if l.strip()]
+if not lines:
+    sys.exit("q: %s has no commands" % cmds)
+dst = os.path.join(Q.P["cmds"], name + ".cmds")
+# ATOMIC NAME CLAIM: two agents submitting the same name at the same moment both
+# passed the check above; os.link lets exactly one of them win, instead of one
+# silently overwriting the other's commands and reporting success.
+tmpc = os.path.join(Q.P["tmp"], "%s.%d.cmds" % (name, os.getpid()))
+with open(tmpc, "w") as fh:
+    fh.write("".join(l + "\n" for l in lines))
+    fh.flush()
+    os.fsync(fh.fileno())
+if (os.path.exists(dst) and not os.path.exists(Q.state_path(name))
+        and not os.path.exists(pend_path)
+        and time.time() - os.path.getmtime(dst) > 60):
+    # leftover of a submit that died before it spooled.  The 60 s age test is
+    # what keeps this from being the race itself: a competing submit's claim is
+    # milliseconds old, and stealing it would put us back to both-agents-win.
+    os.unlink(dst)
+try:
+    os.link(tmpc, dst)
+except OSError:
+    os.unlink(tmpc)
+    sys.exit("q: the name %r was claimed by another submit a moment ago — "
+             "nothing of yours was queued; pick another name" % name)
+os.unlink(tmpc)
+spec = {"name": name, "cmds_src": os.path.abspath(cmds), "cmds_path": dst,
+        "ntasks": len(lines), "site": site, "cpus": float(cpus),
+        "mem_mib": Q.parse_mem_mib(mem),
+        "threads": int(threads) if threads else max(1, int(round(float(cpus)))),
+        "priority": int(prio), "resumable": int(resumable), "spot": int(spot), "spot_explicit": bool(int(spot_explicit)),
+        "image": image or None, "inputs": inputs or None,
+        "timeout_sec": Q.parse_dur_sec(timeout), "machine": machine or None,
+        "gpu": int(float(gpu)), "epoch": epoch, "vm_cpus":int(vm_cpus), "vast_box": vast_box or None, "vast_chunk": int(vast_chunk) or None,
+        "workdir": os.getcwd(), "user": os.environ.get("USER", "?"),
+        "submitted_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+# footgun checks at submit time, so a bad job never sits WAITING forever
+cfg = Q.load_config()
+if spec['site'] == 'vultr':
+    from vultr_api import validate_spec
+    try: validate_spec(spec)
+    except ValueError as e:
+        os.unlink(dst)
+        sys.exit('q: ' + str(e))
+import site_batch as SB
+mach = (spec["machine"] if spec['site'] != 'vultr' else None) or cfg["Q_BATCH_MACHINE"]
+mcpu = SB.machine_cpus(mach)
+if spec["site"] in ("batch", "either") and spec["cpus"] > mcpu:
+    sys.exit("q: --cpus %s exceeds the %s machine's %d vCPU — Batch would reject "
+             "the job; lower --cpus or pass a bigger --machine" % (cpus, mach, mcpu))
+if spec["site"] in ("batch", "either") and spec["cpus"] > Q.cint(cfg, "Q_BATCH_CPU_CAP"):
+    sys.exit("q: --cpus %s is above the whole Batch cap (%s)" % (cpus, cfg["Q_BATCH_CPU_CAP"]))
+if spec["site"] in ("local", "either"):
+    import site_local as SL
+    imp = SL.LocalSite(cfg).impossible(spec)
+    if imp and spec["site"] == "local":
+        os.unlink(dst)
+        sys.exit("q: this job could never run on this box: %s.\n"
+                 "   Lower the request, or use --site batch." % imp)
+    if imp:
+        print("q: NOTE %s — this job can only run on Batch" % imp)
+    elif spec["mem_mib"] > Q.mem_available_mib():
+        print("q: WARNING --mem %dMiB is above the box's current MemAvailable (%dMiB); "
+              "the job will WAIT for local room" % (spec["mem_mib"], Q.mem_available_mib()))
+tmp = os.path.join(Q.P["tmp"], name + ".json")
+Q.write_json_atomic(tmp, spec)
+os.replace(tmp, os.path.join(Q.P["pending"], name + ".json"))
+print("queued %s: %d task(s), site=%s, cpus=%s, mem=%dMiB, threads=%d, priority=%s"
+      % (name, spec["ntasks"], site, cpus, spec["mem_mib"], spec["threads"], prio))
+print("  q status %s   # the daemon admits it when capacity exists" % name)
+alive = False
+try:
+    qpid = int(open(Q.P["lock"]).read().strip())
+    with open("/proc/%d/cmdline" % qpid, "rb") as fh:
+        alive = b"qd" in fh.read()
+except (IOError, OSError, ValueError):
+    alive = False
+if not alive:
+    print("q: WARNING the queue DAEMON IS NOT RUNNING — your job will sit SPOOLED "
+          "until it is started:\n"
+          "     nohup setsid %s/bin/qd_supervise.sh start >/dev/null 2>&1 &   "
+          "(then `status`)" % os.environ["QCODE"])
+PY
+  ;;
+status|list|log|pull|cancel|board)
+  Q_ROOT="$QROOT" QCODE="$QCODE" "$PY" - "$cmd" "$@" <<'PY'
+import json, os, shutil, subprocess, sys, time
+sys.path.insert(0, os.path.join(os.environ["QCODE"], "lib"))
+import qcommon as Q
+cmd = sys.argv[1]; args = sys.argv[2:]
+def brief(st):
+    c = st.get("counts", {})
+    return "%-24s %-9s %-6s %3s/%-3s prio=%s" % (
+        st["name"], st["state"], st.get("site") or "-", c.get("done", 0),
+        st["ntasks"], st.get("priority", 0))
+if cmd == "board":
+    print(open(Q.P["board"]).read().strip() if os.path.exists(Q.P["board"])
+          else "(no board yet — is qd running?)")
+elif cmd == "list" or (cmd == "status" and not args):
+    states = Q.all_states()
+    pend = [f[:-5] for f in sorted(os.listdir(Q.P["pending"])) if f.endswith(".json")]
+    bad = Q.bad_state_names()
+    print("%-24s %-9s %-6s %-7s %s" % ("JOB", "STATE", "SITE", "DONE", "PRIO"))
+    for st in sorted(states, key=lambda s: s["created"]):
+        print(brief(st))
+    for n in pend:
+        print("%-24s %-9s %-6s %3s/%-3s (not yet ingested)" % (n, "SPOOLED", "-", 0, "?"))
+    for n in bad:
+        print("%-24s %-9s %-6s %3s/%-3s !! state/%s.json is UNREADABLE — this job "
+              "is invisible to the daemon" % (n, "BROKEN", "-", "?", "?", n))
+    if not states and not pend and not bad:
+        print("(no jobs)")
+elif cmd == "status":
+    name = args[0]
+    st = Q.load_state(name)
+    if st is None:
+        p = os.path.join(Q.P["pending"], name + ".json")
+        if os.path.exists(p):
+            print("%s SPOOLED (waiting for the daemon's next cycle)" % name)
+            sys.exit(0)
+        if os.path.exists(Q.state_path(name)):
+            sys.exit("q: %s exists but its state file is UNREADABLE (%s). The daemon "
+                     "cannot see this job either: its tasks are untracked. Do NOT "
+                     "resubmit under the same name until it is moved aside."
+                     % (name, Q.state_path(name)))
+        sys.exit("q: no such job %r" % name)
+    if "--json" in args:
+        print(json.dumps(st, indent=1, sort_keys=True)); sys.exit(0)
+    print(brief(st))
+    sp = st["spec"]
+    print("  spec: site=%s cpus=%s mem=%dMiB threads=%s spot=%s resumable=%s "
+          "gpu=%s timeout=%ss%s"
+          % (sp["site"], sp["cpus"], sp["mem_mib"], sp["threads"], sp["spot"],
+             sp["resumable"], sp.get("gpu", 0), sp.get("timeout_sec"),
+             " epoch=%s" % sp["epoch"] if sp.get("epoch") else ""))
+    print("  cmds: %s (%d tasks)" % (sp["cmds_src"], st["ntasks"]))
+    if st.get("site") == "local":
+        for i in range(st["ntasks"]):
+            t = st["tasks"][str(i)]
+            print("   task %-4d %-9s rc=%-5s peak_rss=%sMiB %s"
+                  % (i, t["state"], t.get("rc"), t.get("rss_peak_mib", 0),
+                     t.get("reason", "")))
+        print("  outputs: %s/<task_i>  (q pull %s DEST)"
+              % (os.path.join(Q.P["localout"], name), name))
+    for c in st.get("chunks", []):
+        # .get() throughout: a status command must never traceback on a chunk
+        # shape it does not recognise (site_vast has no spot/tag, it has a box).
+        where = c.get("box") or c.get('instance_id')
+        print("   chunk %-6s %-22s %-10s %s tasks %s %s %s"
+              % (c.get("tag", c.get("kind", "-")), c.get("job", "-"), c.get("state", "?"),
+                 len(c.get("indices", [])), c.get("kind", "-"),
+                 ("box=%s" % where) if where else "spot=%d" % int(c.get("spot", 0)),
+                 c.get("counts", {})))
+    if st.get("pull"):
+        p = st["pull"]
+        print("  pulled: %s files, %s bytes, manifest %s, witness %s %s at %s"
+              % (p.get("files"), p.get("bytes"), (p.get("manifest") or "-")[:16],
+                 (p.get("witness") or {}).get("path", "-"),
+                 (p.get("witness") or {}).get("sha256", "-")[:16], p.get("at")))
+    for e in st.get("events", [])[-8:]:
+        print("  . " + e)
+elif cmd == "log":
+    if not args:
+        sys.exit("q: log NAME")
+    p = os.path.join(Q.P["logs"], args[0] + ".log")
+    print(open(p).read().rstrip() if os.path.exists(p) else "(no log yet for %s)" % args[0])
+elif cmd == "cancel":
+    if not args:
+        sys.exit("q: cancel NAME")
+    name = args[0]
+    if not Q.valid_name(name):
+        sys.exit("q: %r is not a job name" % name)
+    if Q.load_state(name) is None and not os.path.exists(
+            os.path.join(Q.P["pending"], name + ".json")):
+        sys.exit("q: no such job %r" % name)
+    open(os.path.join(Q.P["cancel"], name), "w").close()
+    print("cancel requested for %s (the daemon acts on it next cycle)" % name)
+elif cmd == "pull":
+    if len(args) < 2:
+        sys.exit("q: pull NAME DEST")
+    name, dest = args[0], args[1]
+    st = Q.load_state(name)
+    if st is None:
+        sys.exit("q: no such job %r" % name)
+    src = os.path.join(Q.P["localout"] if st.get("site") == "local" else Q.P["cache"], name)
+    if st.get('site') == 'vultr':
+        # Export available live checkpoints without publishing their return codes
+        # as verified completion. Canonical cache still contains complete tasks.
+        sources = [(src,False)] if os.path.isdir(src) else []
+        for chunk in st.get('chunks',[]):
+            partial = os.path.join(Q.ROOT,'vultr','pull',chunk['tag'],'out')
+            if not chunk.get('collected') and os.path.isdir(partial): sources.append((partial,True))
+        if not sources: sys.exit('q: no Vultr outputs pulled yet')
+        os.makedirs(dest,exist_ok=True)
+        for source,partial in sources:
+            argv=['rsync','-a'] + (['--exclude=_rc.txt'] if partial else []) + [source+'/',dest+'/']
+            if subprocess.call(argv): sys.exit('q: output copy failed')
+        print('q pull %s -> %s (%s)' % (name,dest,'includes unverified live checkpoints; their return codes excluded' if any(p for _,p in sources) else 'verified task outputs'))
+        sys.exit(0)
+    if not os.path.isdir(src):
+        sys.exit("q: nothing pulled yet for %r (the daemon pulls Batch output at "
+                 "most once per %s s per job, and force-pulls when a chunk goes "
+                 "terminal; check `q status %s`)"
+                 % (name, Q.load_config()["Q_PULL_INTERVAL_SEC"], name))
+    os.makedirs(dest, exist_ok=True)
+    # local copy only — the daemon owns every network transfer
+    rc = subprocess.call(["rsync", "-a", src + "/", dest + "/"]) \
+        if shutil.which("rsync") else subprocess.call(["cp", "-a", src + "/.", dest + "/"])
+    n = sum(len(f) for _, _, f in os.walk(dest))
+    print("q pull %s -> %s: rc=%d, %d files now in DEST" % (name, dest, rc, n))
+    if st.get("pull"):
+        p = st["pull"]
+        print("  daemon-side verify: %s files, %s bytes, witness %s"
+              % (p.get("files"), p.get("bytes"),
+                 (p.get("witness") or {}).get("sha256", "-")[:16]))
+PY
+  ;;
+*) usage;;
+esac

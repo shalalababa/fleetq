@@ -1,0 +1,741 @@
+#!/usr/bin/env python3
+"""qd — the job-queue daemon.
+
+One process schedules every wave.  Agents (human or AI) never call gcloud,
+gsutil, ssh or `&` on compute: they `q submit` and read `q status`.  The daemon
+is the only thing on this machine that talks to Google Batch or the rented
+boxes, and it makes exactly ONE `gcloud batch jobs list` call per cycle no
+matter how many jobs are in flight.
+
+Run it under bin/qd_supervise.sh (it is restart-safe: local tasks are
+re-adopted by pid+starttime, and every task is idempotent on $OUT/_rc.txt).
+
+  qd [--once] [--cycles N] [--cycle-sec S]
+"""
+import fcntl
+import json
+import os
+import shutil
+import signal
+import sys
+import time
+
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib"))
+
+import qcommon as Q                      # noqa: E402
+from site_vultr import VultrSite         # noqa: E402
+from site_local import LocalSite         # noqa: E402
+from site_batch import BatchSite, TERMINAL, NEVER_RAN  # noqa: E402
+from site_vast import (VastSite, TERMINAL as VTERMINAL,  # noqa: E402
+                       NEVER_RAN as VNEVER_RAN)
+
+STOP = False
+
+
+def _sig(_s, _f):
+    global STOP
+    STOP = True
+    Q.log("SIGNAL received — finishing cycle and exiting (local tasks keep running)")
+
+
+class Daemon(object):
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.local = LocalSite(cfg)
+        self.batch = BatchSite(cfg)
+        self.vast = VastSite(cfg)
+        self.vultr = VultrSite(cfg)
+        self.cycle_n = 0
+
+    # ------------------------------------------------------------- ingest
+    def ingest(self):
+        d = Q.P["pending"]
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".json"):
+                continue
+            spec = Q.read_json(os.path.join(d, fn))
+            if not spec:
+                Q.log("INGEST bad spec %s — moved aside" % fn)
+                os.replace(os.path.join(d, fn),
+                           os.path.join(Q.P["accepted"], fn + ".bad"))
+                continue
+            name = spec["name"]
+            if os.path.exists(Q.state_path(name)):
+                Q.log("INGEST %s already has state — pending file discarded" % name)
+                os.replace(os.path.join(d, fn), os.path.join(Q.P["accepted"], fn + ".dup"))
+                continue
+            st = {"name": name, "spec": spec, "state": "PENDING",
+                  "site": None, "ntasks": spec["ntasks"],
+                  "cmds_path": spec["cmds_path"],
+                  "priority": spec.get("priority", 0),
+                  "created": spec["submitted_at"], "tasks": {}, "chunks": [],
+                  "retries": 0, "events": []}
+            for i in range(spec["ntasks"]):
+                st["tasks"][str(i)] = {"state": "PENDING", "attempts": 0,
+                                       "mem_kills": 0, "rc": None}
+            Q.event(st, "queued: %d tasks, site=%s cpus=%s mem=%dMiB threads=%s prio=%s"
+                    % (spec["ntasks"], spec["site"], spec["cpus"], spec["mem_mib"],
+                       spec["threads"], spec.get("priority", 0)))
+            Q.save_state(st)
+            os.replace(os.path.join(d, fn), os.path.join(Q.P["accepted"], fn))
+
+    def cancels(self, states):
+        d = Q.P["cancel"]
+        for fn in sorted(os.listdir(d)):
+            name = fn
+            st = Q.load_state(name)
+            if not st:
+                pend = os.path.join(Q.P["pending"], name + ".json")
+                if os.path.exists(pend):
+                    os.unlink(pend)      # cancelled before it was ever ingested
+                    Q.log("CANCEL %s: removed from the spool before admission" % name)
+                else:
+                    Q.log("CANCEL %s: no such job" % name)
+                os.unlink(os.path.join(d, fn))
+                continue
+            if st["state"] in ("DONE", "FAILED", "CANCELLED"):
+                os.unlink(os.path.join(d, fn))
+                continue
+            if st.get("site") == "local":
+                self.local.cancel(st)
+            elif st.get("site") == "batch":
+                self.batch.cancel(st)
+            elif st.get("site") == "vast":
+                self.vast.cancel(st)
+            elif st.get('site') == 'vultr':
+                self.vultr.cancel(st)
+                Q.save_state(st)
+                os.unlink(os.path.join(d, fn))
+                continue
+            st["state"] = "CANCELLED"
+            Q.event(st, "CANCELLED by operator")
+            Q.save_state(st)
+            os.unlink(os.path.join(d, fn))
+
+    # ------------------------------------------------------------- local
+    def outdirs(self, st, i):
+        """Both places a finished task can have left its $OUT/_rc.txt: the local
+        tree, and the pulled cache of a Batch run of the same job name."""
+        return (self.local.outdir(st["name"], i),
+                os.path.join(Q.P["cache"], st["name"], "task_%d" % i))
+
+    def rc_anywhere(self, st, i):
+        for d in self.outdirs(st, i):
+            if Q.read_rc(d) == 0:
+                return 0
+        return None
+
+    def resume_scan(self, st):
+        """A task whose $OUT/_rc.txt is 0 is already done — never re-run it."""
+        n = 0
+        for i in range(st["ntasks"]):
+            t = st["tasks"][str(i)]
+            if t["state"] in ("PENDING",) and self.rc_anywhere(st, i) == 0:
+                t["state"] = "DONE"
+                t["rc"] = 0
+                t["reason"] = "resume: $OUT/_rc.txt already 0"
+                n += 1
+        if n:
+            Q.event(st, "resume: %d task(s) already complete, skipped" % n)
+        return n
+
+    def advance_local(self, st, states):
+        lines = read_lines(st["cmds_path"])
+        launched = 0
+        for i in range(st["ntasks"]):
+            t = st["tasks"][str(i)]
+            if t["state"] != "PENDING":
+                continue
+            if self.rc_anywhere(st, i) == 0:
+                t["state"], t["rc"] = "DONE", 0
+                t["reason"] = "resume: $OUT/_rc.txt already 0"
+                continue
+            if not self.local.fits(st["spec"], states):
+                break
+            if not self.local.launch(st, i, lines[i], states):
+                break
+            launched += 1
+        return launched
+
+    # ------------------------------------------------------------- cross-site reservations
+    def sync_external_reservations(self, st):
+        """Merge only proven rc=0 local reservation outputs into this family cache.
+
+        A reservation belongs to the original Batch family, but its commands run
+        in a separately named local q job.  This bridge is durable in state and
+        prevents a completed local tranche from waiting for a human cache copy.
+        """
+        cache_root = os.path.join(Q.P["cache"], st["name"])
+        for r in st.get("external_reservations", []):
+            if r.get("state") != "ACTIVE":
+                continue
+            try:
+                rows = json.load(open(r["mapping"]))
+            except (OSError, ValueError, KeyError) as exc:
+                if not r.get("mapping_error"):
+                    r["mapping_error"] = str(exc)
+                    Q.event(st, "external reservation %s mapping unavailable: %s" %
+                            (r.get("name", "?"), exc))
+                continue
+            complete = True
+            for row in rows:
+                oi = row.get("original_index", row.get("original_batch_index"))
+                li = row.get("local_task")
+                if oi is None or li is None:
+                    complete = False
+                    continue
+                src = self.local.outdir(r["name"], int(li))
+                dst = os.path.join(cache_root, "task_%d" % int(oi))
+                if Q.read_rc(src) != 0:
+                    complete = False
+                    continue
+                if Q.read_rc(dst) == 0:
+                    continue
+                if os.path.exists(dst):
+                    complete = False
+                    if not r.get("conflict_reported"):
+                        r["conflict_reported"] = True
+                        Q.event(st, "external reservation %s has nonterminal destination %s; refusing overwrite" %
+                                (r["name"], dst))
+                    continue
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copytree(src, dst)
+            if complete and rows:
+                r["state"] = "DONE"
+                r["integrated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+                Q.event(st, "external reservation %s integrated %d proven local task(s)" %
+                        (r["name"], len(rows)))
+
+    # ------------------------------------------------------------- batch
+    def advance_batch(self, st):
+        if not self.batch.list_ok:
+            return
+        self.sync_external_reservations(st)
+        spec = st["spec"]
+        self.batch.update_chunks(st)
+        now = time.time()
+        term_at = 0
+        newly = False
+        for c in st.get("chunks", []):
+            if c["state"] == "SUBMITTING":
+                continue                      # update_chunks owns this one
+            if c["state"] not in TERMINAL and c["job"] not in self.batch.jobs:
+                c["missing"] = c.get("missing", 0) + 1
+                if c["missing"] >= 3:
+                    c["state"] = "FAILED"
+                    Q.event(st, "chunk %s vanished from the Batch listing on 3 "
+                                "consecutive cycles (deleted elsewhere?) — treating "
+                                "it as FAILED; unfinished tasks will be resubmitted"
+                            % c["job"])
+            elif c["job"] in self.batch.jobs:
+                c["missing"] = 0
+            # a chunk that never gets a VM (quota full, or the zone is out of that
+            # machine type) is NOT an error, but it must be visible rather than
+            # silently occupying the job's one-chunk-at-a-time slot forever
+            if (c["state"] not in TERMINAL and not c.get("stalled")
+                    and not any(c["counts"].get(k) for k in ("RUNNING", "SUCCEEDED", "FAILED"))
+                    and now - c.get("submitted", now) > Q.cint(self.cfg, "Q_STALL_WARN_SEC")):
+                c["stalled"] = True
+                c["stalled_at"] = now
+                Q.event(st, "STALLED: %s has had no task leave PENDING in %d min "
+                            "(state %s) — quota full, or the zone has no capacity for "
+                            "%s. Nothing is lost; `q cancel` and resubmit smaller if "
+                            "this is not what you want."
+                        % (c["job"], Q.cint(self.cfg, "Q_STALL_WARN_SEC") // 60,
+                           c["state"], c["machine"]))
+            # ... and a chunk that is STILL sitting there long after the warning
+            # is not "patient", it is a dead slot: this job can hold only one
+            # chunk in flight, so it would never make progress again.  Delete it
+            # and let the recovery path resubmit (on demand, so a spot/zone
+            # exhaustion does not simply repeat).
+            abort = Q.cint(self.cfg, "Q_STALL_ABORT_SEC")
+            if (abort and c["state"] not in TERMINAL and c.get("stalled")
+                    and now - c.get("submitted", now) > abort):
+                self.batch.cancel_chunk(
+                    st, c, "no VM in %d min (Q_STALL_ABORT_SEC) — the cap or the "
+                           "zone never had room for %s; the unfinished tasks are "
+                           "resubmitted on demand" % (abort // 60, c["machine"]))
+        for c in st.get("chunks", []):
+            if c["state"] in TERMINAL and not c.get("terminal_at"):
+                c["terminal_at"] = now
+                newly = True
+                Q.event(st, "chunk %s terminal: %s %s" % (c["job"], c["state"], c["counts"]))
+            term_at = max(term_at, c.get("terminal_at", 0))
+        # don't spawn a gsutil for a job that has not written anything yet:
+        # gs://.../out does not exist until the first task starts.
+        started = any(c["counts"].get(k) for c in st.get("chunks", [])
+                      for k in ("RUNNING", "SUCCEEDED", "FAILED"))
+        # `newly` alone is not enough: a chunk cancelled or lost before any task
+        # ran is "newly terminal" with nothing in GCS to pull, and the gsutil call
+        # can then only fail with "does not name a directory".
+        # A terminal Batch status is only a request for a final result pull; it
+        # is not evidence that the cache contains the task's _rc.txt yet.  With
+        # asynchronous pulls, ``last`` can also describe a failed transfer, so
+        # keep forcing a final pull until one succeeds after the newest terminal
+        # chunk.  This prevents a skip-only recovery chunk from being submitted
+        # during the gap between SUCCEEDED and the local result landing.
+        pull = st.get("pull", {})
+        needs_final_pull = bool(term_at and
+                                (pull.get("last", 0) < term_at or
+                                 pull.get("rc") != 0 or pull.get("active")))
+        if st.get("chunks") and started:
+            self.batch.pull(st, force=newly or needs_final_pull)
+        done = self.batch.done_indices(st)
+        inflight = [c for c in st.get("chunks", []) if c["state"] not in TERMINAL]
+        st["counts"] = {"done": len(done), "total": st["ntasks"]}
+        attempted = set()
+        for c in st.get("chunks", []):
+            if c["state"] in NEVER_RAN:
+                continue
+            attempted.update(c["indices"])
+        # A task can be deliberately allocated to another existing site (for
+        # example a local G7A partition while Batch remains full).  Keep that
+        # ownership in the original job state, so a daemon restart cannot make
+        # a later Batch chunk duplicate the still-running external task.
+        reservations = [r for r in st.get("external_reservations", [])
+                        if r.get("state") == "ACTIVE"]
+        reserved = set()
+        for r in reservations:
+            reserved.update(int(i) for i in r.get("indices", []))
+        never = [i for i in range(st["ntasks"])
+                 if i not in attempted and i not in done and i not in reserved]
+        if inflight:
+            # A long active chunk must not strand compatible Batch capacity.
+            # Only add never-attempted indices here: retry/failed settlement
+            # remains deferred until all earlier chunks are terminal and pulled.
+            plan = self.batch.plan_chunk(spec, never) if never else None
+            if plan is not None:
+                Q.event(st, "BACKFILL: %d never-attempted task(s) while %d chunk(s) run"
+                        % (len(plan["indices"]), len(inflight)))
+                self.batch.submit_chunk(st, plan["indices"],
+                                        spot=bool(spec.get("spot", 1)),
+                                        kind="chunk", first=False)
+            return
+        failed = sorted(i for i in attempted if i not in done)
+        pull = st.get("pull", {})
+        pulled_after = (pull.get("last", 0) >= term_at and pull.get("rc") == 0
+                        and not pull.get("active"))
+        if (failed or never) and started and not pulled_after:
+            return                                   # wait for a successful final pull
+        if st.get("submit_fails", 0) >= Q.cint(self.cfg, "Q_SUBMIT_MAX_FAILS"):
+            st["state"] = "FAILED"
+            Q.event(st, "FAILED: %d consecutive submit failures (Q_SUBMIT_MAX_FAILS)"
+                    % st["submit_fails"])
+            return
+        if failed:
+            if not spec.get("resumable"):
+                st["state"] = "FAILED"
+                Q.event(st, "FAILED: %d task(s) did not finish and resumable=0: %s"
+                        % (len(failed), failed[:20]))
+                return
+            if st["retries"] >= Q.cint(self.cfg, "Q_MAX_CHUNK_RETRIES"):
+                st["state"] = "FAILED"
+                Q.event(st, "FAILED after %d on-demand retries; still missing %s"
+                        % (st["retries"], failed[:20]))
+                return
+            plan = self.batch.plan_chunk(spec, failed)
+            if plan is None:
+                return                               # no cap room yet — wait
+            st["retries"] += 1
+            Q.event(st, "PREEMPTION/FAILURE RECOVERY: %d task(s) missing after a "
+                        "spot chunk -> resubmitting ON-DEMAND (spot=0), seeded from "
+                        "existing $OUT" % len(plan["indices"]))
+            self.batch.submit_chunk(st, plan["indices"], spot=False,
+                                    kind="ondemand", first=False)
+            return
+        if never:
+            plan = self.batch.plan_chunk(spec, never)
+            if plan is None:
+                return
+            self.batch.submit_chunk(st, plan["indices"], spot=bool(spec.get("spot", 1)),
+                                    kind="chunk", first=not st.get("chunks"))
+            st["state"] = "RUNNING"
+            return
+        if reservations:
+            # External workers still own real unfinished cells. Do not mark the
+            # original Batch family done merely because its own chunks are done.
+            st["state"] = "RUNNING"
+            if not st.get("external_wait_announced"):
+                Q.event(st, "waiting for %d externally reserved task(s)" %
+                        sum(len(r.get("indices", [])) for r in reservations))
+                st["external_wait_announced"] = True
+            return
+        st["state"] = "DONE"
+        Q.event(st, "DONE: %d/%d tasks rc=0 (verified from pulled $OUT)"
+                % (len(done), st["ntasks"]))
+
+    # ------------------------------------------------------------- admission
+    def schedule(self, states):
+        """Walk ready jobs in priority order and backfill compatible capacity."""
+        cands = [s for s in states if s["state"] in ("PENDING", "RUNNING")]
+        cands.sort(key=lambda s: (-int(s.get("priority", 0)), s["created"], s["name"]))
+        blocked = {"local": False, "batch": False, "vast": False, "vultr": False}
+        for st in cands:
+            if st.get('site') == 'vultr' or (st.get('site') is None and st['spec']['site'] == 'vultr'):
+                self.vultr.advance(st)
+                continue
+            if st["state"] == "RUNNING":
+                if st.get("site") == "local" and not blocked["local"]:
+                    self.advance_local(st, states)
+                continue
+            spec = st["spec"]
+            want = spec["site"]
+            self.resume_scan(st)
+            if all(t["state"] == "DONE" for t in st["tasks"].values()):
+                st["state"] = "DONE"
+                Q.event(st, "DONE without running: every $OUT/_rc.txt was already 0")
+                continue
+            imp = self.local.impossible(spec)
+            if imp and want == "local":
+                st["state"] = "FAILED"
+                Q.event(st, "FAILED at admission: %s. This job could only ever "
+                            "WAIT, so it is refused now rather than silently "
+                            "forever; resubmit with a smaller request or "
+                            "--site batch." % imp)
+                continue
+            site = None
+            if want == "local":
+                site = "local" if not blocked["local"] and self.local.fits(spec, states) else None
+            elif want == "batch":
+                site = "batch" if (not blocked["batch"] and self.batch.list_ok
+                                   and self.batch.plan_chunk(spec, range(st["ntasks"]))) else None
+            elif want == "vast":
+                site = "vast" if (not blocked["vast"] and self.vast.list_ok
+                                  and self.vast.plan_chunk(spec, range(st["ntasks"]))) else None
+            else:  # either
+                prefer_local = st["ntasks"] < 4
+                lok = (not imp and not blocked["local"]
+                       and self.local.fits(spec, states))
+                bok = (not blocked["batch"] and self.batch.list_ok
+                       and bool(self.batch.plan_chunk(spec, range(st["ntasks"]))))
+                vok = (not blocked["vast"] and self.vast.list_ok
+                       and bool(self.vast.plan_chunk(spec, range(st["ntasks"]))))
+                # EXPLICIT, CONFIGURABLE PRECEDENCE.  Adding a site silently
+                # re-routed every `--site either` job, which is a contract change
+                # dressed as a feature; Q_EITHER_ORDER makes it a stated policy.
+                # Default puts vast ahead of batch: the rented boxes are paid for
+                # whether or not we use them, while Batch costs money per use and
+                # its 32-vCPU cap is shared with legacy gbatch waves.
+                avail = {"local": lok, "batch": bok, "vast": vok,
+                         "vultr": self.vultr.can_fit(spec)}
+                order = [x.strip() for x in
+                         str(self.cfg.get("Q_EITHER_ORDER", "local,vast,batch")).split(",")
+                         if x.strip()]
+                if prefer_local and lok:
+                    site = "local"
+                else:
+                    site = next((c for c in order if c != "local" and avail.get(c)), None)
+                    if site is None and lok:
+                        site = "local"      # last resort, as before
+                if site is None:
+                    for k, v in avail.items():
+                        blocked[k] = blocked[k] or not v
+            if site is None:
+                ft, fm, _ = self.local.capacity(states)
+                Q.event(st, "WAITING (site=%s): local free %d thr / %d MiB "
+                            "(reserve %d MiB, want %d thr / %d MiB%s), "
+                            "batch free %s vCPU of cap %d"
+                        % (want, ft, fm, self.local.reserve_mb, spec["threads"],
+                           spec["mem_mib"], "; LOCAL IMPOSSIBLE: " + imp if imp else "",
+                           self.batch.free_cpus() if self.batch.list_ok else "?",
+                           self.batch.cap))
+                continue
+            st["site"] = site
+            st["state"] = "RUNNING"
+            Q.event(st, "ADMITTED to %s" % site)
+            if site == "local":
+                if self.advance_local(st, states) == 0:
+                    st["state"] = "PENDING"
+                    st["site"] = None
+                    blocked["local"] = True
+            elif site == "vast":
+                self.advance_vast(st)
+            elif site == 'vultr':
+                self.vultr.advance(st)
+            else:
+                self.advance_batch(st)
+
+    # ------------------------------------------------------------- vast
+    def advance_vast(self, st):
+        """One chunk in flight per job, as with Batch.
+
+        Completion is decided by the PULLED $OUT/_rc.txt files, never by the
+        runner's own log — the launch ssh cannot be trusted to return (a remote
+        backgrounded process blocks it to the client timeout), so acceptance is
+        never taken as execution.
+
+        A task that keeps failing is retried at most Q_MAX_CHUNK_RETRIES times;
+        without that cap a permanently-broken task would be re-planned into a
+        fresh chunk every cycle forever (site_batch's S10 defect, by another road).
+        """
+        if not self.vast.list_ok:
+            return
+        spec = st["spec"]
+        self.vast.update_chunks(st)
+        now = time.time()
+        newly = False
+        for c in st.get("chunks", []):
+            if c["state"] in VTERMINAL and not c.get("terminal_at"):
+                c["terminal_at"] = now
+                newly = True
+                Q.event(st, "chunk %s terminal on box %s (%d task(s))"
+                        % (c["job"], c["box"], len(c["indices"])))
+        if st.get("chunks"):
+            self.vast.pull(st, force=newly)
+        done = self.vast.done_indices(st)
+        st["counts"] = {"done": len(done), "total": st["ntasks"]}
+        inflight = [c for c in st.get("chunks", [])
+                    if c["state"] not in VTERMINAL and c["state"] not in VNEVER_RAN]
+        if inflight:
+            return
+        remaining = [i for i in range(st["ntasks"]) if i not in done]
+        if not remaining:
+            st["state"] = "DONE"
+            Q.event(st, "DONE: %d/%d tasks rc=0" % (len(done), st["ntasks"]))
+            return
+        # WAIT FOR THE TRUTH TO LAND before deciding anything is unfinished.
+        # A chunk can go terminal microseconds before its outputs are pulled; if
+        # we re-plan on that gap we resubmit work that actually succeeded. (The
+        # remote runner's rc==0 skip makes the resubmit cheap rather than wrong,
+        # but the event log would lie about what happened.) Same guard as
+        # advance_batch's `pulled_after`.
+        term_at = max([c.get("terminal_at", 0) for c in st.get("chunks", [])] or [0])
+        if term_at and st.get("pull", {}).get("last", 0) < term_at:
+            return
+        if st.get("submit_fails", 0) >= Q.cint(self.cfg, "Q_SUBMIT_MAX_FAILS"):
+            st["state"] = "FAILED"
+            Q.event(st, "FAILED: %d consecutive submit failures (Q_SUBMIT_MAX_FAILS)"
+                    % st["submit_fails"])
+            return
+        tries = st.setdefault("vast_tries", {})
+        maxtry = max(1, Q.cint(self.cfg, "Q_MAX_CHUNK_RETRIES") + 1)
+        eligible = [i for i in remaining if tries.get(str(i), 0) < maxtry]
+        exhausted = [i for i in remaining if i not in eligible]
+        if not eligible:
+            if not spec.get("resumable"):
+                st["state"] = "FAILED"
+            else:
+                st["state"] = "FAILED"
+            Q.event(st, "FAILED: %d task(s) never returned rc=0 after %d attempt(s): %s"
+                    % (len(exhausted), maxtry, exhausted[:20]))
+            return
+        plan = self.vast.plan_chunk(spec, eligible)
+        if not plan:
+            Q.event(st, "WAITING (site=vast): no box has headroom under the "
+                        "%.1f-core cap right now (loads %s)"
+                    % (self.vast.cap,
+                       ", ".join("box%s=%.1f" % (b, self.vast.load.get(b, -1))
+                                 for b in sorted(self.vast.load))))
+            return
+        st["pending_box"] = plan["box"]
+        for i in plan["indices"]:
+            tries[str(i)] = tries.get(str(i), 0) + 1
+        self.vast.submit_chunk(st, plan["indices"], spec.get("spot"), "run",
+                               not st.get("chunks"))
+
+    # ------------------------------------------------------------- finalize
+    def finalize(self, st):
+        if st["state"] in ("DONE", "FAILED", "CANCELLED"):
+            return
+        if st.get("site") == "local":
+            ts = st["tasks"].values()
+            done = sum(1 for t in ts if t["state"] == "DONE")
+            failed = sum(1 for t in ts if t["state"] == "FAILED")
+            st["counts"] = {"done": done, "failed": failed, "total": st["ntasks"]}
+            if done + failed == st["ntasks"]:
+                st["state"] = "DONE" if failed == 0 else "FAILED"
+                Q.event(st, "%s: %d done / %d failed" % (st["state"], done, failed))
+
+    # ------------------------------------------------------------- board
+    def board(self, states):
+        ft, fm, nrun = self.local.capacity(states)
+        used_thr = len(self.local.used_cpus(states))
+        bits = []
+        for st in sorted(states, key=lambda s: s["name"]):
+            if st["state"] in ("DONE", "FAILED", "CANCELLED") and \
+                    time.time() - os.path.getmtime(Q.state_path(st["name"])) > 86400:
+                continue
+            c = st.get("counts", {})
+            bits.append("%s=%s[%s]%s/%s" % (st["name"], st["state"],
+                                            st.get("site") or "-",
+                                            c.get("done", 0), st["ntasks"]))
+        bstr = ("%d/%d vCPU in flight" % (self.batch.used_cpus(), self.batch.cap)
+                if self.batch.list_ok else "-/%d vCPU (not polled: no batch jobs)"
+                % self.batch.cap)
+        if self.vast.list_ok:
+            vstr = "%d cores free of %.0f/box (%s)" % (
+                self.vast.free_cpus(), self.vast.cap,
+                ", ".join("box%s load %.1f" % (b, self.vast.load[b])
+                          for b in sorted(self.vast.load)) or "no boxes")
+        else:
+            vstr = "not polled (no vast jobs)"
+        line = ("%s | cycle %d | local %d/%d thr used, %d MiB free (reserve %d thr/%d MiB), "
+                "%d task(s) | batch %s | vast %s | %s"
+                % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), self.cycle_n,
+                   used_thr, len(self.local.pool), fm,
+                   self.local.reserve_threads, self.local.reserve_mb, nrun,
+                   bstr, vstr, " ".join(bits) if bits else "(no jobs)"))
+        if self.vultr.enabled or self.vultr.path.exists():
+            line += ' | vultr ' + self.vultr.summary()
+        with open(Q.P["board"], "w") as fh:
+            fh.write(line + "\n")
+        Q.log("BOARD " + line.split(" | ", 1)[1])
+
+    # ------------------------------------------------------------- cycle
+    def restore_remote_ownership(self, states):
+        """Repair the one unsafe legacy state shape: RUNNING + chunks + no site.
+
+        A prior daemon persisted Batch submission intent and later overwrote the
+        top-level ``site`` with null.  Such a job was then invisible to both the
+        Batch monitor and completion puller.  The chunk record is the stronger
+        witness here; only infer a site when the job's own requested site agrees.
+        """
+        for st in states:
+            if st.get("state") != "RUNNING" or st.get("site") is not None:
+                continue
+            if not st.get("chunks"):
+                continue
+            want = st.get("spec", {}).get("site")
+            if want == "batch" and all("box" not in c for c in st["chunks"]):
+                st["site"] = "batch"
+                Q.event(st, "restored Batch monitor ownership from existing chunk record")
+                Q.save_state(st)
+            elif want == "vast" and all("box" in c for c in st["chunks"]):
+                st["site"] = "vast"
+                Q.event(st, "restored Vast monitor ownership from existing chunk record")
+                Q.save_state(st)
+
+    def cycle(self):
+        self.cycle_n += 1
+        Q.log("CYCLE %d begin" % self.cycle_n)
+        self.ingest()
+        states = Q.all_states()
+        self.cancels(states)
+        states = Q.all_states()
+        self.restore_remote_ownership(states)
+        states = Q.all_states()
+        active = [s for s in states if s["state"] in ("PENDING", "RUNNING")]
+        if self.cycle_n == 1:
+            # first cycle of this process: re-adopt anything a previous daemon
+            # life left half-launched, BEFORE anything can decide to re-run it
+            for st in active:
+                if st.get("site") == "local" and self.local.adopt(st):
+                    Q.save_state(st)
+        if self.local.poll(active):
+            pass
+        # Local-only work must not wait behind unrelated remote-result pulls.
+        # Admit or advance it before refreshing Batch/Vast, whose reconciliation
+        # can involve slow network copies. The normal full scheduling pass below
+        # still owns cross-site placement after fresh remote capacity is known.
+        local_active = [s for s in active if s.get("site") == "local" or
+                        (s.get("site") is None and s["spec"]["site"] == "local")]
+        if local_active:
+            self.schedule(local_active)
+        need_batch = any(s["state"] in ("PENDING", "RUNNING") and
+                         (s.get("site") == "batch" or
+                          (s.get("site") is None and s["spec"]["site"] in ("batch", "either")))
+                         for s in states)
+        if need_batch:
+            self.batch.refresh()
+        else:
+            self.batch.list_ok = False
+            self.batch.jobs = {}
+            Q.log("no batch-eligible jobs — skipping the gcloud list call this cycle")
+        need_vast = any(s["state"] in ("PENDING", "RUNNING") and
+                        (s.get("site") == "vast" or
+                         (s.get("site") is None and s["spec"]["site"] in ("vast", "either")))
+                        for s in states)
+        if need_vast:
+            self.vast.refresh()
+        else:
+            self.vast.list_ok = False
+            Q.log("no vast-eligible jobs — skipping the box load poll this cycle")
+        # Dispatch ready jobs with freshly refreshed capacity before network pulls.
+        need_vultr = any(s.get('site') == 'vultr' or s.get('spec',{}).get('site') == 'vultr'
+                         or (s.get('spec',{}).get('site') == 'either' and 'vultr' in self.cfg.get('Q_EITHER_ORDER','').split(','))
+                         for s in active)
+        if need_vultr or self.vultr.path.exists():
+            self.vultr.refresh()
+        # Result transfers must not delay independent local or Batch submissions.
+        self.schedule(active)
+        for st in active:
+            if st.get("site") == "batch" and st["state"] == "RUNNING":
+                self.advance_batch(st)
+            elif st.get("site") == "vast" and st["state"] == "RUNNING":
+                self.advance_vast(st)
+        for st in active:
+            self.finalize(st)
+            Q.save_state(st)
+        self.vultr.maintenance(Q.all_states())
+        self.board(Q.all_states())
+        Q.log("CYCLE %d end" % self.cycle_n)
+
+
+def read_lines(path):
+    with open(path) as fh:
+        return [l.rstrip("\n") for l in fh if l.strip()]
+
+
+def main():
+    once = "--once" in sys.argv
+    cycles = None
+    if "--cycles" in sys.argv:
+        cycles = int(sys.argv[sys.argv.index("--cycles") + 1])
+    Q.ensure_tree()
+    cfg = Q.load_config()
+    # "a+", never "w": opening with "w" TRUNCATES the file before the flock test,
+    # which would erase the running instance's pid every time a second qd starts.
+    lock = open(Q.P["lock"], "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        lock.seek(0)
+        sys.stderr.write("qd: another instance (pid %s) holds %s — refusing to start\n"
+                         % (lock.read().strip() or "?", Q.P["lock"]))
+        return 3
+    lock.seek(0)
+    lock.truncate()
+    lock.write("%d\n" % os.getpid())
+    lock.flush()
+    signal.signal(signal.SIGTERM, _sig)
+    signal.signal(signal.SIGINT, _sig)
+    Q.log("qd START pid=%d root=%s cap=%s reserve=%s thr/%d MiB (floor %s, %s%%)"
+          % (os.getpid(), Q.ROOT, cfg["Q_BATCH_CPU_CAP"],
+             cfg["Q_LOCAL_RESERVE_THREADS"], Q.local_reserve_mb(cfg),
+             cfg["Q_LOCAL_RESERVE_MB"], cfg["Q_LOCAL_RESERVE_PCT"]))
+    if Q.ROOT != Q.CODE and os.environ.get("Q_DRY_RUN") != "1":
+        Q.log("WARNING sandbox Q_ROOT=%s but LIVE gcloud/gsutil: this daemon can "
+              "submit real Batch jobs and write to the real bucket. Set Q_DRY_RUN=1 "
+              "for an offline sandbox." % Q.ROOT)
+    d = Daemon(cfg)
+    cyc = Q.cint(cfg, "Q_CYCLE_SEC")
+    rss = Q.cint(cfg, "Q_RSS_POLL_SEC")
+    n = 0
+    while not STOP:
+        t0 = time.time()
+        try:
+            d.cycle()
+        except Exception as e:                       # never die on one bad job
+            import traceback
+            Q.log("CYCLE ERROR %s: %s" % (type(e).__name__, e))
+            Q.log(traceback.format_exc())
+        n += 1
+        if once or (cycles is not None and n >= cycles):
+            break
+        # sleep in RSS-watchdog steps: an over-cap task is killed within ~5 s,
+        # not up to a whole cycle later
+        while not STOP and time.time() - t0 < cyc:
+            time.sleep(min(rss, max(0.2, cyc - (time.time() - t0))))
+            act = [s for s in Q.all_states() if s["state"] == "RUNNING"
+                   and s.get("site") == "local"]
+            if act and d.local.poll(act):
+                for st in act:
+                    d.finalize(st)
+                    Q.save_state(st)
+    Q.log("qd STOP pid=%d after %d cycle(s)" % (os.getpid(), n))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

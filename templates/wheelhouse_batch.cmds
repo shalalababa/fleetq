@@ -1,0 +1,31 @@
+# wheelhouse_batch.cmds -- TEMPLATE, one lane = one Batch task.
+#
+# Why this exists: a home link that is token-bucket shaped.  A small wheel
+# arrives at ~10 MB/s, but a sustained large download from the PyPI CDN
+# collapsed to ~70 kB/s (measured: 4.19 MB in 60 s of a 393 MB CUDA wheel), so
+# ~5 GB of wheels was hours of wall clock.  GCS -> local measured 14.3 MB/s on
+# the same link and is NOT shaped, so it is ~200x faster for exactly this
+# payload.  A Batch task sits on Google's network, pulls the wheels at full
+# speed, and the normal Batch pull brings them home over the fast path.
+#
+# NOTE: virtualenvs are NOT relocatable -- absolute paths are baked into the
+# scripts and into pyvenv.cfg.  What moves is the WHEELHOUSE, not the env.
+# Install locally, offline, with:
+#   python3.11 -m venv myenv && . myenv/bin/activate
+#   pip install --no-index --find-links $Q_ROOT/cache/<job>/task_0/wheelhouse \
+#       -r $Q_ROOT/cache/<job>/task_0/freeze.txt
+#
+# Usage (build_wheelhouse.sh is yours: typically `pip download -r freeze.txt
+# -d "$OUT/wheelhouse"` plus a copy of freeze.txt into $OUT):
+#   1. put freeze.txt + build_wheelhouse.sh in $Q_ROOT/inputs/<name>/
+#   2. upload them:  gcloud storage rsync $Q_ROOT/inputs/<name> \
+#                      gs://$Q_BUCKET/inputs/<name>
+#   3. STRIP THE COMMENTS into the job's cmds file -- the Batch runner indexes
+#      lanes.cmds by line number, so a comment line would become a task:
+#        grep -v '^#' templates/wheelhouse_batch.cmds | grep -v '^$' > <name>.cmds
+#   4. bin/q submit --name <name> --cmds <name>.cmds --site batch \
+#        --cpus 2 --mem 4G --priority 4 --image python:3.11-slim \
+#        --inputs <name> --gpu 0
+#
+# The single lane below is the whole job.
+bash "$IN/build_wheelhouse.sh"

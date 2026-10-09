@@ -1,0 +1,4 @@
+echo "hello from task $Q_TASK" > "$OUT/hello.txt"; python3 -c "print(sum(range(10**6)))" > "$OUT/sum.txt"
+echo "task $Q_TASK pinned to cpus $(taskset -pc $$ | awk '{print $NF}')" > "$OUT/hello.txt"; sleep 2
+python3 -c "import json, os; json.dump({'task': os.environ['Q_TASK'], 'omp_threads': os.environ['OMP_NUM_THREADS']}, open(os.environ['OUT'] + '/meta.json', 'w'))"
+if [ -e "$IN/ready" ]; then echo ok > "$OUT/result.txt"; else echo "missing $IN/ready" >&2; exit 3; fi

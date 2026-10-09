@@ -1,0 +1,15 @@
+# fleetq is Python standard library only (Python >= 3.9) plus POSIX shell tools.
+# Nothing here is needed for the local site / quickstart beyond Linux + bash.
+#
+# Optional Python package:
+#   pyyaml        lets wave specs be written as spec.yaml (spec.json needs nothing)
+#
+# External command-line tools, by feature (not pip-installable; listed for reference):
+#   local site    bash, util-linux (taskset, flock), procps; Linux /proc for PSS
+#   Google Batch  gcloud CLI (gcloud storage); gsutil only as a fallback transport
+#   Vast boxes    ssh, rsync, tar, zstd, curl (on the box), vastai CLI (fleet refresh/destroy)
+#   gcs relay     gcloud (service-account impersonation for the short-lived token)
+#   r2 relay      rclone
+#   Vultr VMs     ssh, rsync, tar; docker on the VM image
+#   Slurm waves   sbatch, squeue (run on the cluster login node)
+#   box alerts    curl to an ntfy.sh topic (optional)
