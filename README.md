@@ -198,6 +198,22 @@ byte-identical commands. `fleet pack` assigns runs to lanes by longest
 processing time first over measured durations, so lanes on a box drain at the
 same time instead of leaving GPUs idle while one lane finishes.
 
+## Waves example
+
+`examples/wave_hello/spec.json` is a small wave with three toy `train` runs
+that write a step-named checkpoint and two score lines. Each dependent `eval`
+run checks its training checkpoint and writes a result file. Generate and
+inspect the artifacts locally, without submitting to a box:
+
+```bash
+python3 fleet/wavegen.py examples/wave_hello --lanes 0,1 --out /tmp/wave_hello_generated
+cat /tmp/wave_hello_generated/RUN_IDS.txt
+```
+
+The generated lane files, submit and pull scripts, and bundle script share
+the run list in `runs.json`. To check outputs after running the commands, use
+`python3 fleet/wavecheck.py examples/wave_hello --runroot /path/to/runroot`.
+
 ## Watchers (`watchers/`)
 
 Long-lived, detached controller-side processes for unattended nights. Each
@@ -340,7 +356,9 @@ bash tests/run_all.sh
 Offline tests run the real daemon against a temporary `Q_ROOT` with fake
 cloud listings (`Q_FAKE_LIST`) and dry-run pulls. `t7_watchers` runs the
 three watchers against a temp directory standing in for a box (a fake `ssh`
-on `PATH` executes the remote script locally). Tests that need a real
+on `PATH` executes the remote script locally). `t8_relay` checks the relay,
+`t9_task_pull` checks task pulls, `t10_lanes` checks lane queues, and
+`t11_waves` checks wave generation and validation. Tests that need a real
 Batch project or a real Vast box exit 77 (skipped) unless
 `FLEETQ_CLOUD_TESTS=1` is set.
 

@@ -696,7 +696,7 @@ if [ "$shared" -gt 0 ]; then
   echo "   An in-place RESUME/EXTENSION appends to scores.jsonl / metrics.jsonl /" >> "$mode_f"
   echo "   other append-only logs and will mutate this bundle too, breaking its manifest." >> "$mode_f"
   echo "   ARCHIVE OF RECORD = the local rsync copy + its committed manifest." >> "$mode_f"
-  echo "   Before any registered in-place resume of these runs, either" >> "$mode_f"
+  echo "   Before any planned in-place resume of these runs, either" >> "$mode_f"
   echo "   materialize this bundle (real copy) or mark it superseded." >> "$mode_f"
 else
   echo "=> All sampled files are unshared real copies." >> "$mode_f"
