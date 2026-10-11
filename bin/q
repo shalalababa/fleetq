@@ -5,7 +5,7 @@
 #   q submit --name N --cmds lanes.cmds [--site local|batch|vast|vultr|either] [--cpus C]
 #            [--mem 2G] [--threads T] [--priority P] [--resumable 1] [--spot 1|0]
 #            [--image IMG] [--inputs SUBPATH] [--timeout 6h] [--machine M] [--gpu 1] [--vm-cpus N] [--vast-box ID] [--vast-chunk N] [--vast-any]
-#   q status [N] | q list | q log N | q pull N DEST | q cancel N | q board | q vultr doctor|plans|fleet
+#   q status [N [--json]] | q list | q log N | q pull N DEST | q cancel N | q board | q vultr doctor|plans|fleet
 set -euo pipefail
 QCODE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 QROOT="${Q_ROOT:-$QCODE}"

@@ -27,7 +27,7 @@ There are two halves:
                                                  |
                                                  v
                                    qd  (one process, one cycle every Q_CYCLE_SEC)
-                                    |   state/<job>.json  ledger.tsv  BOARD.txt
+                                    |   state/<job>.json  BOARD.txt
           +-------------+-----------+-------------+------------------+
           |             |                         |                  |
       site_local    site_batch                site_vast          site_vultr
@@ -47,9 +47,10 @@ There are two halves:
 ```
 
 All queue state is files: `spool/` for submissions, `state/<job>.json` per job
-(written atomically), `ledger.tsv` append-only, `logs/`, `cache/` for pulled
-results. The daemon can be killed at any point and restarted; it re-adopts
-what is running.
+(written atomically), `logs/`, `cache/` for pulled results. Batch submissions
+also append intent and submit outcomes to `ledger.tsv`; local jobs do not
+create that file. The daemon can be killed at any point and restarted; it
+re-adopts what is running.
 
 ## The invariants
 
@@ -82,11 +83,14 @@ absence cost real work; `docs/LESSONS.md` has the incidents.
    largest one). The GCS relay ships a per-file sha256 manifest and the box's
    relay marker only advances after the local side verifies it.
 
-5. **A rented box is destroyed only after a verified pull.** `fleet destroy N`
-   reports by default. With `--yes` it first inventories every run dir on the
+5. **A rented box is checked against the archive before destruction.**
+   `fleet destroy N` reports by default. With `--yes` it inventories every run dir on the
    box and requires each one to exist in the archive with counters at least as
    large (checkpoint step, score lines, file count, bytes) and matching
-   identity-file hashes. An empty remote listing is a failure, not a pass.
+   identity-file hashes. An unreadable inventory fails the gate; a valid
+   inventory with zero run dirs has nothing to compare and may pass.
+   `--force-unsafe` permits unarchived dirs after an additional typed
+   confirmation.
 
 6. **Intent is persisted before side effects.** A local task is recorded as
    `LAUNCHING` before fork; a Batch submit is recorded before the API call, and
@@ -235,11 +239,17 @@ bash examples/quickstart.sh
 ```
 
 `examples/quickstart.sh` creates a scratch install root at
-`.scratch/quickstart` (override with `Q_ROOT=...`), writes a minimal
-`config.env`, submits `examples/hello.cmds` (four tasks, one of which fails
-until an input file exists), runs `qd` for a few cycles in the foreground,
-shows the failure, creates the input, resubmits the same job name, and shows
-that only the failed task runs again. Output from a run on a 16-thread laptop:
+`.scratch/quickstart` (pass a different directory as its first argument).
+It writes a minimal `config.env` and submits `examples/hello.cmds` (four tasks,
+one of which fails until an input file exists). It runs `qd` for a few cycles
+in the foreground, shows the failure, creates the input, resubmits the same
+job name, and shows that only the failed task runs again. Output from a run on
+a 16-thread laptop:
+
+The script removes its scratch root before each run. Both submits may print a
+daemon warning because `qd` runs only for the bounded cycles shown here.
+`q status` also prints command and output paths; timestamps, PIDs, memory and
+file counts vary by machine.
 
 ```
 ### 3. status: task 3 fails because $IN/ready does not exist yet
@@ -270,28 +280,40 @@ q pull hello -> .scratch/quickstart/pulled: rc=0, 25 files now in DEST
 cycle 3 | local 0/15 thr used, 6984 MiB free (reserve 1 thr/1793 MiB), 0 task(s) | batch -/32 vCPU (not polled: no batch jobs) | vast not polled (no vast jobs) | hello=DONE[local]4/4
 ```
 
-To run the daemon for real:
+To run the same workflow manually in a separate local root:
 
 ```bash
-cp config.env.example config.env      # edit; only the local section is needed
-bin/qd_supervise.sh start             # restarts qd if it dies; logs to qd.log
-bin/q submit --name myjob --cmds myjob.cmds --site local --cpus 2 --mem 4G
+export Q_ROOT="$PWD/.scratch/manual"
+mkdir -p "$Q_ROOT"
+cp config.env.example "$Q_ROOT/config.env"  # edit the local section if needed
+printf 'echo hello > "$OUT/hello.txt"\n' > "$Q_ROOT/myjob.cmds"
+nohup setsid bin/qd_supervise.sh start >/dev/null 2>&1 &
+bin/q submit --name myjob --cmds "$Q_ROOT/myjob.cmds" --site local --cpus 2 --mem 4G
 bin/q status
 bin/q board
 ```
 
-Inside each task `$OUT` is the task's output directory and `$IN` the job's
-input directory; thread-count environment variables follow `--threads`
-(`examples/hello.cmds` prints them). A task that exits 0 gets `_rc.txt` = 0 and is never run
-again.
+The supervisor restarts `qd` if it exits and writes `supervise.log` under
+`Q_ROOT`. Status and board can show a spooled job until the next daemon cycle.
+After `bin/q status myjob` shows `DONE`, stop this manual supervisor with
+`bin/qd_supervise.sh stop`.
+
+Inside a local task, `$OUT` is the task's output directory and `$IN` is
+`$Q_ROOT/inputs` (or its `--inputs` subpath). The local runner exports `Q_JOB`,
+`Q_TASK`, `Q_THREADS`, and thread-count variables from `--threads`
+(`examples/hello.cmds` prints some of them). Batch and Vultr set `$IN` and
+`$OUT` in their runners; Vast uses `QVAST_IN` for `$IN`. A local task that
+exits 0 gets `_rc.txt` = 0 and is skipped on resubmit.
 
 ## Configuration
 
 Everything is in one shell-sourceable file, `config.env` (start from
 `config.env.example`). `Q_ROOT` is the install root -- spool, state, logs,
 caches and fleet state live under it -- and defaults to the checkout. Every
-key can be overridden by an environment variable of the same name;
-`Q_CONFIG=/path` selects a different file.
+queue config key can be overridden by an environment variable of the same
+name; `Q_CONFIG=/path` selects a different file. `bin/fleet` sources the file
+as shell code, so a value set in it takes precedence over an existing
+environment variable with the same name.
 
 Per-site setup:
 

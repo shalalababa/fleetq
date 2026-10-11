@@ -10,11 +10,13 @@ the measured ones.
 that later turned out to be needed, and GPU nondeterminism meant they could not
 be re-created bit-for-bit. Destroying a rented box deletes every run dir on it
 just as surely, with no `rm` typed.
-*Decision:* `fleet destroy` reports by default and only destroys after an
+*Decision:* `fleet destroy` reports by default and, with `--yes`, destroys after an
 inventory proves every run dir on the box exists in the archive with counters
 at least as large (checkpoint step, score lines, file count, bytes) and
 matching identity-file hashes. Greater-or-equal, not equal: an archive
-accumulates runs from several boxes. An empty remote listing fails the gate.
+accumulates runs from several boxes. An unreadable inventory fails the gate;
+a valid inventory with zero run dirs has no archive comparison to make.
+`--force-unsafe` permits unarchived dirs after an additional typed confirmation.
 
 **A symlink is not an archive.** A trainer wrote checkpoints under a cache
 directory and symlinked them into the run dir. Pulls re-planted dangling links

@@ -29,6 +29,7 @@ EOF
 printf 'export REPO=%s RUNROOT=%s FLEET_BOX_HOME=%s\n' "$T" "$T/runroot" "$HERE/box" > "$T/fleet_env"
 mkdir -p "$T/runroot/run_a"; echo x > "$T/runroot/run_a/f.txt"   # a run dir NOT in the archive
 printf '#!/bin/sh\necho "FAKE VASTAI CALLED $*" >> "%s/vastai_calls"\n' "$T" > "$T/bin/vastai"
+# The fake box has no GPU work. Do not read the controller's nvidia-smi output.
 printf '#!/bin/sh\ncase "$*" in *compute-apps*) ;; *) echo 0 ;; esac\n' > "$T/bin/nvidia-smi"
 chmod +x "$T/bin/ssh" "$T/bin/vastai" "$T/bin/nvidia-smi"
 echo 'export IP9=127.0.0.1; export PORT9=22' > "$T/root/fleet_state/instances.env"
