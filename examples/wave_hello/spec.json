@@ -1,0 +1,30 @@
+{
+  "wave_id": "wave_hello",
+  "notes": "Small local example of a train stage and dependent evaluation stage.",
+  "stages": [
+    {
+      "name": "train",
+      "target": "lanes",
+      "run_id": "train_${item}",
+      "expand": {"item": ["a", "b", "c"]},
+      "cmd": "mkdir -p ${RUNROOT}/${run_id}/ckpt/model-10 && touch ${RUNROOT}/${run_id}/ckpt/model-10/done && printf '%s\\n%s\\n' '{\"score\":1}' '{\"score\":2}' > ${RUNROOT}/${run_id}/scores.jsonl",
+      "done_when": [
+        {"ckpt_step_min": 10},
+        {"jsonl_min_lines": {"file": "scores.jsonl", "n": 2}}
+      ]
+    },
+    {
+      "name": "eval",
+      "target": "lanes",
+      "needs": "train",
+      "run_id": "eval_${item}",
+      "expand": {"item": ["a", "b", "c"]},
+      "cmd": "test -f ${RUNROOT}/train_${item}/ckpt/model-10/done && mkdir -p ${RUNROOT}/${run_id} && printf '{\"accuracy\":1}\\n' > ${RUNROOT}/${run_id}/result.json",
+      "done_when": [
+        {"exists": "result.json"},
+        {"ckpt_step_min": {"dir": "../train_${item}", "min": 10}}
+      ]
+    }
+  ],
+  "bundle": {"prefix": "hello", "include_stages": ["train", "eval"]}
+}

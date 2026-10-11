@@ -194,6 +194,22 @@ byte-identical commands. `fleet pack` assigns runs to lanes by longest
 processing time first over measured durations, so lanes on a box drain at the
 same time instead of leaving GPUs idle while one lane finishes.
 
+## Waves example
+
+`examples/wave_hello/spec.json` is a small wave with three toy `train` runs
+that write a step-named checkpoint and two score lines. Each dependent `eval`
+run checks its training checkpoint and writes a result file. Generate and
+inspect the artifacts locally, without submitting to a box:
+
+```bash
+python3 fleet/wavegen.py examples/wave_hello --lanes 0,1 --out /tmp/wave_hello_generated
+cat /tmp/wave_hello_generated/RUN_IDS.txt
+```
+
+The generated lane files, submit and pull scripts, and bundle script share
+the run list in `runs.json`. To check outputs after running the commands, use
+`python3 fleet/wavecheck.py examples/wave_hello --runroot /path/to/runroot`.
+
 ## Watchers (`watchers/`)
 
 Long-lived, detached controller-side processes for unattended nights. Each

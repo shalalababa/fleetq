@@ -15,10 +15,10 @@ run () {
   esac
   rm -f "$log"
 }
-for t in t1_local t3_capacity t4_preempt t5_routing t7_watchers t2_batch t2_check t2b_pull t3b_batchcap t6_vast; do
+for t in t1_local t3_capacity t4_preempt t5_routing t7_watchers t8_lanes t2_batch t2_check t2b_pull t3b_batchcap t6_vast; do
   [ -f "$HERE/$t.sh" ] && run "$t" bash "$HERE/$t.sh"
 done
-for t in test_pullfix test_vultr test_vultr_cli; do
+for t in test_pullfix test_vultr test_vultr_cli t9_waves; do
   tmp_root="$(mktemp -d)"
   [ -f "$HERE/$t.py" ] && run "$t" env Q_ROOT="$tmp_root" Q_CONFIG=/dev/null python3 "$HERE/$t.py"
   rm -rf "$tmp_root"

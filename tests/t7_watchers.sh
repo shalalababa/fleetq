@@ -22,7 +22,10 @@ EOF
 printf 'export REPO=%s RUNROOT=%s FLEET_BOX_HOME=%s\n' "$T" "$T/runroot" "$HERE/box" > "$T/fleet_env"
 mkdir -p "$T/runroot/run_a"; echo x > "$T/runroot/run_a/f.txt"   # a run dir NOT in the archive
 printf '#!/bin/sh\necho "FAKE VASTAI CALLED $*" >> "%s/vastai_calls"\n' "$T" > "$T/bin/vastai"
-chmod +x "$T/bin/ssh" "$T/bin/vastai"
+# The fake box must not read the host GPU: an NVML error on stdout looks
+# like a compute-app PID to the destroy gate.
+printf '#!/usr/bin/env bash\nexit 0\n' > "$T/bin/nvidia-smi"
+chmod +x "$T/bin/ssh" "$T/bin/vastai" "$T/bin/nvidia-smi"
 echo 'export IP9=127.0.0.1; export PORT9=22' > "$T/root/fleet_state/instances.env"
 echo '{"instances":[{"index":9,"vast_id":"12345"}]}' > "$T/root/fleet_state/instances.json"
 printf 'Q_VAST_REMOTE_ROOT=%s\nFLEET_ARCHIVE_ROOT=%s\n' "$T/remote" "$T/archive" > "$T/root/config.env"
