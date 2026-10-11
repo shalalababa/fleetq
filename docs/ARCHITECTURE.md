@@ -27,11 +27,11 @@
 | `spool/pending/` | `q submit` | job specs waiting to be ingested |
 | `state/<job>.json` | `qd` (atomic rename) | job and per-task state, attempts, site bookkeeping |
 | `state/archive/` | `q submit` on resume | previous epochs of a resubmitted job |
-| `ledger.tsv` | `qd` (append-only) | one line per state transition |
+| `ledger.tsv` | Batch adapter (append-only) | Batch submit intent, failure, and acceptance; absent for local-only jobs |
 | `BOARD.txt` | `qd` | the latest board, readable without the daemon |
 | `local_out/<job>/task_<i>/` | local tasks | `$OUT` for local tasks: `_rc.txt`, `_pid.txt`, logs |
 | `cache/<job>/` | pull worker / relays | pulled results from remote sites |
-| `inputs/<name>/` | you | job inputs (`--inputs`) |
+| `inputs/` or `inputs/<subpath>/` | you | local job input root, optionally selected by `--inputs` |
 | `logs/` | `qd`, pull workers | per-job and per-pull logs |
 | `fleet_state/` | `fleet refresh`, `fleet destroy` | `instances.json/.env`, `destroyed.jsonl`, `durations.json` |
 | `waves/<id>/` | you, `fleet gen` | `spec.json` and `generated/` |
@@ -111,8 +111,9 @@ night.
 `fleet/destroy_box.sh` uses `fleet/runroot_inventory.py` on both the box and
 the archive (`FLEET_ARCHIVE_HOST`/`FLEET_ARCHIVE_ROOT`, or local). Every run
 dir on the box must be present in the archive with counters at least as large
-and matching identity hashes. Two confirmations are read from stdin, so an
-unattended destroy pipes them in deliberately.
+and matching identity hashes. A valid empty box inventory has no run dirs to
+compare. `--yes` prompts for the Vast id. `--force-unsafe` permits unarchived
+dirs and additionally prompts for `DESTROY UNARCHIVED` when any are found.
 
 ## Watchers
 

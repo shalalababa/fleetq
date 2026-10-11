@@ -19,10 +19,12 @@ cat > "$T/bin/ssh" <<EOF
 for a; do last=\$a; done
 sed "s|/root/.fleet_env|$T/fleet_env|g" | bash -c "\$last"
 EOF
+# The fake box has no GPU work. Do not read the controller's nvidia-smi output.
+printf '#!/bin/sh\nexit 0\n' > "$T/bin/nvidia-smi"
 printf 'export REPO=%s RUNROOT=%s FLEET_BOX_HOME=%s\n' "$T" "$T/runroot" "$HERE/box" > "$T/fleet_env"
 mkdir -p "$T/runroot/run_a"; echo x > "$T/runroot/run_a/f.txt"   # a run dir NOT in the archive
 printf '#!/bin/sh\necho "FAKE VASTAI CALLED $*" >> "%s/vastai_calls"\n' "$T" > "$T/bin/vastai"
-chmod +x "$T/bin/ssh" "$T/bin/vastai"
+chmod +x "$T/bin/ssh" "$T/bin/vastai" "$T/bin/nvidia-smi"
 echo 'export IP9=127.0.0.1; export PORT9=22' > "$T/root/fleet_state/instances.env"
 echo '{"instances":[{"index":9,"vast_id":"12345"}]}' > "$T/root/fleet_state/instances.json"
 printf 'Q_VAST_REMOTE_ROOT=%s\nFLEET_ARCHIVE_ROOT=%s\n' "$T/remote" "$T/archive" > "$T/root/config.env"

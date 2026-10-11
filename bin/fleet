@@ -32,8 +32,11 @@ fleet <verb> [args]
     sh N [cmd...]           ssh into box N (no cmd = interactive)
     watch N [secs]          nvidia-smi + lane log loop on box N
     events N [k]            tail the box event log (what the watchdog/queue emitted)
-    destroy N [--yes]       destroy a Vast box -- REPORTS by default; refuses
-                            unless every run dir on it is already archived
+    destroy N [--yes] [--force-unsafe]
+                            destroy a Vast box -- REPORTS by default; refuses
+                            unless every run dir on it is already archived;
+                            --force-unsafe bypasses the archive gate with
+                            typed confirmations
     cluster-connect [--status|--close]
                             open/reuse ONE shared ssh connection to the cluster
                             login node, so later cluster commands skip 2FA
