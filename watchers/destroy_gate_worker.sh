@@ -74,13 +74,18 @@ PY
 }
 
 COUNT_PROCS='ps -eo stat=,args= | RE="$2" awk '"'"'$1 !~ /^T/ && $2 != "flock" && $0 ~ ENVIRON["RE"] {k++} END{print k+0}'"'"
-COUNT_ROOTS='for j in "$1"/*/; do [ -d "$j/out" ] && printf "%s %s\n" "$(basename "$j")" "$(find "$j/out" -type f | wc -l)"; done; echo END'
+COUNT_ROOTS='found=0; for j in "$1"/*/; do [ -d "$j/out" ] || continue; found=1; files=$(find "$j/out" -type f -printf .) || exit 1; printf "%s %s\n" "$(basename "$j")" "${#files}"; done; [ "$found" -eq 1 ] || exit 1; echo END'
 
 check_box(){   # echoes PASS or the first failing reason
-  local n=$1 j st bx procs roots rn ln
+  local n=$1 j st bx procs roots rn ln q_list
   [ -f "$FLEET_STATE/no_more_work_box$n" ] ||
     { echo "no no_more_work_box$n marker (work not declared finished)"; return; }
   # (1) every queue job placed on this box is terminal
+  q_list=$(timeout 90 "$Q" list 2>/dev/null) ||
+    { echo "queue listing failed -- refusing"; return; }
+  if printf '%s\n' "$q_list" | awk '$2=="BROKEN"{bad=1} END{exit !bad}'; then
+    echo "queue has unreadable state -- refusing"; return
+  fi
   while read -r j st; do
     [ -n "$j" ] || continue
     case "$st" in DONE|FAILED|CANCELLED) continue ;; esac
@@ -89,18 +94,23 @@ import json, sys
 d = json.load(open(sys.argv[1]))
 print(d["spec"].get("vast_box") or d.get("pending_box") or "")
 PY
-)
+) || { echo "cannot read job $j state -- refusing"; return; }
     [ "$bx" = "$n" ] && { echo "job $j still $st on box $n"; return; }
-  done < <(timeout 90 "$Q" list 2>/dev/null | awk '$3=="vast"{print $1" "$2}')
+  done < <(printf '%s\n' "$q_list" | awk '$3=="vast"{print $1" "$2}')
   # (2) no science processes on the box
-  procs=$(on_box "$n" "$COUNT_PROCS" | tr -d '[:space:]')
-  [ -n "$procs" ] || { echo "box $n unreachable while counting processes -- refusing"; return; }
+  procs=$(on_box "$n" "$COUNT_PROCS") ||
+    { echo "box $n unreachable while counting processes -- refusing"; return; }
+  procs=${procs//[[:space:]]/}
+  [[ "$procs" =~ ^[0-9]+$ ]] || { echo "box $n returned invalid process count -- refusing"; return; }
   [ "$procs" -gt 0 ] && { echo "box $n still has $procs science process(es)"; return; }
   # (3) every job tree fully pulled, superset rule at out/ level
-  roots=$(on_box "$n" "$COUNT_ROOTS" 300)
-  case "$roots" in *END*) ;; *) echo "box $n unreachable while counting files -- refusing"; return ;; esac
+  roots=$(on_box "$n" "$COUNT_ROOTS" 300) ||
+    { echo "box $n unreachable while counting files -- refusing"; return; }
+  [ "${roots##*$'\n'}" = END ] ||
+    { echo "box $n returned incomplete file inventory -- refusing"; return; }
   while read -r j rn; do
     [ -n "$j" ] && [ "$j" != END ] || continue
+    [[ "$rn" =~ ^[0-9]+$ ]] || { echo "box $n returned invalid file count -- refusing"; return; }
     [ "$rn" -eq 0 ] && continue
     ln=$(find "$Q_ROOT/cache/$j" -type f 2>/dev/null | wc -l)
     [ "$ln" -lt "$rn" ] && { echo "job $j NOT fully pulled from box $n (local $ln < remote $rn files under out/)"; return; }

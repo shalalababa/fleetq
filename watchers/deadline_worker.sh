@@ -141,15 +141,20 @@ timeout 240 bash -c 'source "$1/fleet/common.sh"; fl_ssh_script "$2" "$3" "$4"' 
 
 say "--- FINAL verified pull: pull, then enumerate the box tree and compare ---"
 pull_all
-COUNT_ROOTS='for j in "$1"/*/; do [ -d "$j/out" ] && printf "%s %s\n" "$(basename "$j")" "$(find "$j/out" -type f | wc -l)"; done'
-jl=$(on_box "$COUNT_ROOTS" 300 2>/dev/null)
-if [ -z "$jl" ] && ! on_box 'true' 60 >/dev/null 2>&1; then
-  say "=== box $N unreachable for the final count -- marker NOT dropped ==="
+COUNT_ROOTS='found=0; for j in "$1"/*/; do [ -d "$j/out" ] || continue; found=1; files=$(find "$j/out" -type f -printf .) || exit 1; printf "%s %s\n" "$(basename "$j")" "${#files}"; done; [ "$found" -eq 1 ] || exit 1; echo END'
+jl=$(on_box "$COUNT_ROOTS" 300 2>/dev/null) || {
+  say "=== box $N final count failed -- marker NOT dropped ==="
   exit 1
-fi
+}
+[ "${jl##*$'\n'}" = END ] || {
+  say "=== box $N final count incomplete -- marker NOT dropped ==="
+  exit 1
+}
 behind=0
 while read -r j rn; do
-  [ -n "$j" ] || continue
+  [ -n "$j" ] && [ "$j" != END ] || continue
+  [[ "$rn" =~ ^[0-9]+$ ]] || {
+    say "=== box $N invalid final file count -- marker NOT dropped ==="; exit 1; }
   # Superset rule: local >= remote, counted under out/.  Never demand equality.
   ln=$(find "$Q_ROOT/cache/$j" -type f 2>/dev/null | wc -l)
   if [ "$ln" -ge "$rn" ]; then say "  OK      $j local=$ln >= remote_out=$rn"

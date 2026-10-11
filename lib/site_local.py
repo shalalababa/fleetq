@@ -270,7 +270,12 @@ class LocalSite(object):
                 t["ended"] = time.time()
                 t["rc"] = rc
                 strays = [p for p in Q.pgid_pids(pgid, table) if p != t.get("pid")]
-                if strays:
+                if strays and t.get("pid") in table:
+                    # The leader PID is alive but failed the start-time check.
+                    # Its new process group belongs to somebody else.
+                    Q.event(st, "local task %d leader pid was reused — not signaling "
+                            "the new process group" % i)
+                elif strays:
                     # the leader is gone but the group is not: sweep, or those
                     # processes keep the box busy with nothing accounting for them
                     try:

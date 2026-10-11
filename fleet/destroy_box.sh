@@ -91,12 +91,16 @@ busy="$(fl_ssh_box "$N" '
           | grep -c . || true)
   mem=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader 2>/dev/null \
         | tr -d " MiB" | sort -rn | head -1)
-  echo "queues=$n procs=${procs:-0} util=${util:-0} mem=${mem:-0}"')"
+  echo "queues=$n procs=${procs:-0} util=${util:-0} mem=${mem:-0}"')" ||
+  die "could not check work in flight on box $N"
 echo "  $busy"
 q_live="$(printf '%s' "$busy" | sed -n 's/.*queues=\([0-9]*\).*/\1/p')"
 p_live="$(printf '%s' "$busy" | sed -n 's/.*procs=\([0-9]*\).*/\1/p')"
 u_live="$(printf '%s' "$busy" | sed -n 's/.*util=\([0-9]*\).*/\1/p')"
 m_live="$(printf '%s' "$busy" | sed -n 's/.*mem=\([0-9]*\).*/\1/p')"
+for count in "$q_live" "$p_live" "$u_live" "$m_live"; do
+  [[ "$count" =~ ^[0-9]+$ ]] || die "invalid work-in-flight inventory from box $N"
+done
 in_flight=0
 [ "${q_live:-0}" -gt 0 ] && in_flight=1
 [ "${p_live:-0}" -gt 0 ] && in_flight=1

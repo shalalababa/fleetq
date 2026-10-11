@@ -171,9 +171,9 @@ ZS=$(command -v zstd || echo /venv/main/bin/zstd)
 # picked up by the next pull instead of being silently skipped.
 touch "$STAMPF.new"
 if [ -f "$STAMPF" ]; then
-  find out -type f -newer "$STAMPF" -printf '%P\n' > /tmp/qvast.list
+  find out -type f -newer "$STAMPF" -printf '%P\n' > /tmp/qvast.list || exit 28
 else
-  find out -type f -printf '%P\n' > /tmp/qvast.list
+  find out -type f -printf '%P\n' > /tmp/qvast.list || exit 28
 fi
 N=$(wc -l < /tmp/qvast.list)
 if [ "$N" -eq 0 ]; then echo "EMPTY"; rm -f "$STAMPF.new" /tmp/qvast.list; exit 0; fi
@@ -190,7 +190,8 @@ echo "SHA $(sha256sum "$TAR" | awk '{print $1}')"
 echo "SIZ $(stat -c%s "$TAR")"
 echo "CNT $N"
 # per-file manifest of exactly what went into the tar (paths relative to out/)
-(cd out && xargs -a /tmp/qvast.list -d '\n' sha256sum) | sed 's/^/MAN /'
+  manifest=$(cd out && xargs -a /tmp/qvast.list -d '\n' sha256sum) || exit 27
+  printf '%s\n' "$manifest" | sed 's/^/MAN /'
 rm -f "$TAR" /tmp/qvast.list
 exit 0
 REMOTE
@@ -213,10 +214,14 @@ REMOTE
   sha=$(printf '%s\n' "$out" | awk '$1=="SHA"{print $2}' | head -1)
   siz=$(printf '%s\n' "$out" | awk '$1=="SIZ"{print $2}' | head -1)
   cnt=$(printf '%s\n' "$out" | awk '$1=="CNT"{print $2}' | head -1)
-  [ -n "$sha" ] && [ -n "$siz" ] || { echo "relay gcs: no sha/siz from box" >&2; return 85; }
+  [ -n "$sha" ] && [ -n "$siz" ] && [[ "$cnt" =~ ^[1-9][0-9]*$ ]] || {
+    echo "relay gcs: missing or invalid sha/siz/count from box" >&2; return 85; }
 
   local tmpd; tmpd=$(mktemp -d "${TMPDIR:-/tmp}/qvast_gcs.XXXXXX") || return 86
   printf '%s\n' "$out" | sed -n 's/^MAN //p' > "$tmpd/manifest"
+  if [ "$(wc -l < "$tmpd/manifest")" -ne "$cnt" ]; then
+    rm -rf "$tmpd"; echo "relay gcs: incomplete per-file manifest" >&2; return 70
+  fi
   "$gcloud_bin" storage cp "gs://$bucket/$obj" "$tmpd/blob" >&2
   [ $? -eq 0 ] || { rm -rf "$tmpd"; echo "relay gcs: download failed" >&2; return 87; }
   if [ "$(sha256sum "$tmpd/blob" | awk '{print $1}')" != "$sha" ]; then
@@ -228,14 +233,14 @@ REMOTE
 
   # per-file verification against the box's own manifest; ANY mismatch is fatal.
   local bad
-  bad=$( (cd "$DEST" && sha256sum -c --quiet "$tmpd/manifest") 2>&1 | head -5 )
-  if [ -n "$bad" ]; then
+  if ! bad=$(cd "$DEST" && sha256sum -c --quiet "$tmpd/manifest" 2>&1); then
     rm -rf "$tmpd"
-    echo "relay gcs: PER-FILE VERIFY FAILED: $bad" >&2; return 70; fi
+    echo "relay gcs: PER-FILE VERIFY FAILED: ${bad:0:500}" >&2; return 70; fi
   rm -rf "$tmpd"
 
   # only now promote the marker, so a failed pull re-ships instead of losing files
-  $BOXSSH -n "$U@$IP" "mv -f '$jobdir/.relay_marker.new' '$jobdir/.relay_marker'" >/dev/null 2>&1
+  $BOXSSH -n "$U@$IP" "mv -f '$jobdir/.relay_marker.new' '$jobdir/.relay_marker'" >/dev/null 2>&1 || {
+    echo "relay gcs: could not promote box marker" >&2; return 90; }
   [ "$cleanup" = "1" ] && "$gcloud_bin" storage rm "gs://$bucket/$obj" >/dev/null 2>&1
   echo "relay gcs box->gcs->local rc=0 files=$cnt packed=$siz verified=per-file-sha256" >&2
   return 0

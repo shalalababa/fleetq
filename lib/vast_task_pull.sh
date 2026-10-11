@@ -73,11 +73,16 @@ $SSH -n "test -s /tmp/vtask_up.sh && wc -l < /tmp/vtask_up.sh" >/dev/null 2>&1 \
   || { say "FATAL: could not stage box helper"; exit 3; }
 say "box helper staged ok"
 
-tasks=$($SSH -n "ls -1 $RROOT/$JOB/out" 2>/dev/null | grep '^task_' | sort -V)
+listing=$($SSH -n "ls -1 $RROOT/$JOB/out" 2>/dev/null) || {
+  say "could not list tasks on box $BOX"; exit 3; }
+tasks=$(printf '%s\n' "$listing" | grep '^task_' | sort -V)
+[ -n "$tasks" ] || { say "no tasks found on box $BOX"; exit 3; }
 say "tasks on box: $(echo $tasks | wc -w)"
 ok=0; skip=0; fail=0
 for t in $tasks; do
-  rn=$($SSH -n "find $RROOT/$JOB/out/$t -type f 2>/dev/null | wc -l" 2>/dev/null | tr -d '[:space:]')
+  remote_files=$($SSH -n "find $RROOT/$JOB/out/$t -type f -printf ." 2>/dev/null) || {
+    say "$t: could not count remote files"; fail=$((fail+1)); continue; }
+  rn=${#remote_files}
   ln=$(find "$DEST/$t" -type f 2>/dev/null | wc -l)
   if [ -n "$rn" ] && [ "$ln" -ge "$rn" ] && [ "$rn" -gt 0 ]; then skip=$((skip+1)); continue; fi
   obj="jobs/$JOB/relay_task/$t.tar.z"
